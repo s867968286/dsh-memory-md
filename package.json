@@ -1,0 +1,44 @@
+{
+  "name": "dsh-memory-md",
+  "version": "1.0.0",
+  "description": "本地 Markdown 记忆：通过 memory_md_* 工具把值得长期保留的内容写进 ~/.dsh/memory-md/，让助手跨会话记住你。",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "client",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/run.mjs",
+    "check": "node --check src/index.js && node --check src/tools.mjs && node --check src/store.mjs && node --check src/inject.mjs && node --check src/summarize.mjs && node --check src/schema.mjs && node --check src/routes.mjs && node --check src/settings.mjs && node --check src/context.mjs && node --check src/codebuddy-port.mjs && node --check client/client.js"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "memory",
+    "markdown",
+    "system-prompt"
+  ]
+}
