@@ -15,7 +15,7 @@ process.env.DSH_HOME = SANDBOX
 const { isPresetDisabled, readSettings, resolvePaths, writeSettings } = await import(
   '../src/settings.mjs'
 )
-const { registerMemoryTools, TOOL_WRITE, TOOL_SEARCH, TOOL_READ, TOOL_JOURNAL } = await import(
+const { registerMemoryTools, TOOL_WRITE, TOOL_SEARCH, TOOL_READ, TOOL_FORGET, TOOL_JOURNAL } = await import(
   '../src/tools.mjs'
 )
 
@@ -89,6 +89,8 @@ console.log('\n停用后工具全部拒绝')
     ['save', TOOL_WRITE, { scope: 'global', type: 'user', name: 'a', description: 'b', content: 'c' }],
     ['search', TOOL_SEARCH, { query: 'x' }],
     ['read', TOOL_READ, { scope: 'all' }],
+    // 删除也必须拦 —— 否则模型能绕过停用把记忆删掉。
+    ['forget', TOOL_FORGET, { scope: 'global', file: 'user_a.md' }],
     ['journal', TOOL_JOURNAL, { note: 'n' }],
   ]
 

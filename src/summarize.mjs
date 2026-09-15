@@ -39,7 +39,16 @@ import { join } from 'node:path'
 import { MEMORY_ENTRYPOINT, MEMORY_TYPES } from './codebuddy-port.mjs'
 import { journalFileName, resolveScopes } from './context.mjs'
 import { readSettings, resolvePaths } from './settings.mjs'
-import { appendJournal, appendErrorLog, timeStamp, writeMemory, slugify, isSafeFile } from './store.mjs'
+import {
+  appendJournal,
+  appendErrorLog,
+  formatMemoryManifest,
+  isSafeFile,
+  scanMemoryManifest,
+  slugify,
+  timeStamp,
+  writeMemory,
+} from './store.mjs'
 
 /**
  * 同一段内容连续失败多少次后放弃。
@@ -380,12 +389,40 @@ export const SUMMARY_SYSTEM = [
   '**纠正和确认都算** —— 要记原因，不只记结论。',
   '同样要精简：**大多数轮次没有值得长期保留的东西，返回空数组是正常的**，',
   '不要为了"有产出"而凑记忆。',
+  '',
+  '⚠️ **消息末尾会附一份「已有的记忆」清单**（如果记忆库非空）。**写之前先看它**：',
+  '清单里已经有同一件事的条目 → 用**同一个 file 名**覆盖更新，而不是新写一条。',
+  '清单为空或没有相关的 → 才新写。这是避免写出重复记忆的唯一依据 ——',
+  '你**看不到**这些记忆的正文，只能看到文件名与描述。',
+  '注意：这段对话里可能出现的 `<memory-index>` 块也是**已有记忆的索引**，',
+  '不是用户说过的话 —— 不要因为在那里见过某个说法就再存一条。',
+  '拿不准某件事是不是已经记过了，就**不要写** —— 宁可漏记，也不要重复记。',
+  '',
   '**不要存**：代码写法或文件结构（读仓库就知道）、git 历史、调试配方、临时状态、',
   '以及任何未经验证的东西。除非用户明确要求，不要存密钥。',
   '**宁可返回空数组，也不要编造记忆。**',
+  '**即使用户明确要求存，上面这几类也不该原样存** —— 若用户让你记一份 PR 列表或',
+  '活动汇总，问一句其中**哪一点是反直觉的、从代码里看不出来的**，那才值得留。',
+  '',
+  '**按主题组织，不要按时间堆**：一条记忆应当是一个独立成立的主题，',
+  '而不是"这段时间发生了什么"。',
+  '',
+  '**相对日期一律转成绝对日期**（用户说"周四" → 写成具体日期），',
+  '否则这条记忆过一阵就读不懂了。',
+  '',
+  '**四种类型要选对**（选错会让这条记忆日后搜不到）：',
+  '- `user` —— 用户是谁：角色、目标、职责、知识背景。用来把回答调整到适合这个人。',
+  '- `feedback` —— 用户对"该怎么做事"的指示。**纠正和认可都要记**：',
+  '  只记纠正会让你回避过去的错误，却偏离用户已认可的做法，变得过度保守。',
+  '- `project` —— 本工作区里代码和 git 看不到的事：谁在做什么、为什么、何时。',
+  '- `reference` —— 外部系统的入口：东西在哪找（不要抄外部内容，只记指针）。',
   '',
   'feedback/project 类的 content 写成「规则或事实」，然后一行 "**Why:**"、',
   '再一行 "**How to apply:**"。',
+  '',
+  '**description 要短**：一行、约 150 字以内 —— 它会被原样放进记忆索引，',
+  '而索引是整份加载进上下文的，写长了会挤占后面的条目。',
+  '只写「什么场景下这条用得上」，细节留在 content 里。',
   '与本工作区无关的 user/feedback/reference 用 scope "global"；',
   '专属于当前工作区的用 "project"。',
 ].join('\n')
@@ -395,15 +432,63 @@ export const SUMMARY_SYSTEM = [
  * ------------------------------------------------------------------ */
 
 /**
+ * 汇总两个作用域的已有记忆，渲染成一段给后台模型看的清单。
+ *
+ * **为什么要合并两个作用域**：后台总结可能往 global 写（跨项目的偏好），
+ * 也可能往 project 写（本工作区的事）。只给一份清单，它就没法判断
+ * "另一边的库里是不是已经有类似的了"。
+ *
+ * 每行都带作用域前缀（`global/` `project/`），因为模型需要知道
+ * 「要覆盖这一条，该往哪个 scope 写」。
+ *
+ * @returns 渲染好的清单文本；两边都没有记忆时返回空串。
+ */
+function memoryManifestFor(paths, scopes) {
+  const sections = []
+
+  const globalManifest = scanMemoryManifest(join(paths.memoryRoot, 'global'))
+  const globalText = formatMemoryManifest(globalManifest)
+  if (globalText) {
+    sections.push(...globalText.split('\n').map((l) => `[global] ${l}`))
+  }
+
+  if (scopes !== undefined) {
+    const projectManifest = scanMemoryManifest(scopes.project.dir)
+    const projectText = formatMemoryManifest(projectManifest)
+    if (projectText) {
+      sections.push(...projectText.split('\n').map((l) => `[project] ${l}`))
+    }
+  }
+
+  return sections.join('\n')
+}
+
+/**
  * 跑一次总结调用，返回解析后的结果。
+ *
+ * ## `manifest` 是防重复的机械保障
+ *
+ * 这个模型**看不到记忆库**（独立调用，不共享主对话上下文），所以光叮嘱它
+ * 「别写重复的」是没用的 —— 它无从知道已经有什么。把已有条目清单
+ * （`formatMemoryManifest()`）放进 user 消息，它才有判断依据。
+ *
+ * 这是吸收 CodeBuddy `buildExtractPrompt()` 的做法：那边把
+ * `formatMemoryManifest(scanMemoryFiles(dir))` 的结果作为
+ * "## Existing memory files" 一节喂给抽取子代理。
  *
  * @returns `{ notes, memories }`，或 undefined（无内容 / 解析失败）。
  */
-async function runSummary({ llm, route, transcript, signal, logger }) {
+async function runSummary({ llm, route, transcript, existingMemories, signal, logger }) {
+  // `existingMemories` 是**已经渲染好的清单文本**（见 `memoryManifestFor()`），
+  // 不是 manifest 对象 —— 那边已经把两个作用域合并并加好 scope 前缀。
+  const suffix = existingMemories
+    ? '\n\n## 已有的记忆（写之前先看这里，能改就改，别新建重复的）\n\n' + existingMemories
+    : ''
+
   const messages = [
     {
       role: 'user',
-      content: [{ type: 'text', text: `Review this completed turn:\n\n${transcript}` }],
+      content: [{ type: 'text', text: `Review this completed turn:\n\n${transcript}${suffix}` }],
       source: { kind: 'plugin', plugin: 'dsh-memory-md' },
     },
   ]
@@ -808,6 +893,10 @@ export function createTurnStoppingListener({
       }
 
       const scopes = cwd === undefined ? undefined : resolveScopes({ cwd, dshHome: paths.dshHome })
+      // 已有记忆清单 —— 给后台模型判断"是不是已经有类似的了"。
+      // 它看不到记忆库（独立调用，不共享主对话上下文），没有这份清单就只能靠猜。
+      // 两个作用域都给：它可能写 global，也可能写 project。
+      const existingMemories = memoryManifestFor(paths, scopes)
       const fromTurn = state.doneTurn
       state.running = true
       state.runningSince = Date.now()
@@ -822,7 +911,7 @@ export function createTurnStoppingListener({
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(new Error('summary timeout')), summaryTimeoutMs)
         try {
-          const result = await runSummary({ llm, route, transcript, logger, signal: controller.signal })
+          const result = await runSummary({ llm, route, transcript, existingMemories, logger, signal: controller.signal })
           if (result !== undefined) {
             if (result.notes.length > 0 || result.memories.length > 0) {
               const written = persistSummary({

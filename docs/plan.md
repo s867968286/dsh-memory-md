@@ -174,30 +174,33 @@ type: feedback
 **这是 2026-09-13 的第二次修订**（第一次是「从 `section()` 全部改到 `context()`」）。
 第一次修订的理由只对**读盘内容**成立，而当时的实现把**常量协议**也一起搬了过去。
 
-按生命周期分成两段：
+按**是否读盘**分成两段：
 
-| | 协议（`MEMORY_PROTOCOL`） | 索引（`renderMemoryIndex()`） |
+| | 常量段（`MEMORY_PROTOCOL` + `MEMORY_RULES`） | 索引（`renderMemoryIndex()`） |
 |---|---|---|
-| 内容 | 索引是什么、条目什么特征、边界在哪 | 用户级 + 项目级 `MEMORY.md` |
+| 内容 | 索引是什么、怎么用记忆、何时写、四类型判据、写入纪律 | 用户级 + 项目级 `MEMORY.md` |
 | 通道 | `systemPrompt.section()`（系统提示词） | `systemPrompt.context()`（上下文快照） |
-| 读盘 | **否**，纯常量 | 是，随记忆增删而变 |
-| KV Cache | 逐字节恒定 → **前缀始终命中** | 追加在可复用前缀**之后**，不吃前缀 |
+| 读盘 | **否**，纯常量（2638 字符） | 是，随记忆增删而变（约 1478 字符） |
+| KV Cache | 逐字节恒定 → **前缀始终命中**，不产生新消息 | 追加在可复用前缀**之后**，不吃前缀 |
 | 去重 | 无需（常量） | **loop 内建**：内容未变则不注入 |
 | order | `950`（文件引用 900 之后、工具说明 1000+ 之前） | `10000`（官方三项 110/115/120 之后） |
 
-**为什么必须拆：** 两段都塞进 `context()` 时，**协议文本会跟着每次记忆变化重发一遍**，
-而旧快照仍留在历史里（快照是**追加**，不是替换），纯属浪费 token。拆开后系统提示词里
-只有一份协议，快照里只有索引。
+**为什么必须拆（两个方向都成立）：**
+
+- **读盘的不能进 `section()`** —— 会让提示词随文件变化，整个前缀 KV Cache 失效（含全部历史）。
+- **常量不该进 `context()`** —— 快照是**追加而非替换**，常量与读盘内容捆在一起时，
+  读盘内容一变就把常量**整段重发**，而重发的那份**永久留在历史里**。
+  常量放 `section()` 每步都在但缓存命中，**严格更优**。
 
 **关键实现：**
 
 ```js
 ctx.inject(['systemPrompt'], (scope) => {
-  // 协议：静态常量，进提示词
+  // 协议 + 纪律：纯常量，进提示词
   scope.systemPrompt.section({
     name: 'memory-md:protocol',
     order: 950,
-    text: () => MEMORY_PROTOCOL,
+    text: () => memoryPromptText(),
   })
   // 索引：每次装配重读，进快照；空串则不贡献
   scope.systemPrompt.context({
@@ -208,10 +211,19 @@ ctx.inject(['systemPrompt'], (scope) => {
 })
 ```
 
+> **修订记录（2026-09-14，第三次）。** 行为纪律曾在第二次修订后被拼进
+> `renderMemoryIndex()` 的产物，与索引同走 `context()`。**那是错的**：
+> 纪律是纯常量，却因为与读盘的索引捆在同一条快照里，索引一变就被带着
+> 整段重发（2406 字符 × 每次记忆变化），而重发的那份永久占住会话历史。
+> 当时给的理由是「让模型读到『有哪些记忆』的同时读到『该怎么对待』」——
+> 那是**读者便利**，代价却由每一轮请求承担。
+> 现在的判定准则只有一条：**读盘吗？** 不读盘的进 `section()`，读盘的进 `context()`。
+> CodeBuddy 的原版犯同一个错（规则与 `## Current MEMORY.md contents` 拼成
+> 一整块 `<memory>` 每次全量注入），不该照搬。
+
 **进入 section 的硬性前提（不可放宽）：** DSH 每个 step 都重新装配提示词
 （`dsh-agent-loop` 的 `systemPrompt.assemble()`），所以**只有常量**才允许进 section。
-任何读盘的 section 都会让提示词随文件变化，整个前缀的 KV Cache 随之失效 ——
-这条正是第一次修订的原始理由，现在依然成立。
+任何读盘的 section 都会让提示词随文件变化，整个前缀的 KV Cache 随之失效。
 
 **行为：**
 - 索引文件变化 → 下次装配即生效，**不重启**
@@ -226,12 +238,30 @@ ctx.inject(['systemPrompt'], (scope) => {
 ### 注入内容
 
 ```
-协议段（系统提示词）：记忆是什么、索引怎么读、四种 type、边界
-索引快照（上下文）：  1. 用户级 MEMORY.md 索引
-                     2. 项目级 MEMORY.md 索引
+常量段（系统提示词，section）：
+  MEMORY_PROTOCOL —— 索引是什么、怎么读（230 字符）
+  MEMORY_RULES    —— 行为纪律（2406 字符）
+    · 怎么用这些记忆（指针/查阅/别用时当空/静默应用）
+    · ⚠️ 记忆不等于当前事实（点名 file 前先验证）
+    · 什么时候写记忆（正/负面清单 + 成对）
+    · 四种类型怎么选（何时写 / 怎么写 / 为什么）
+    · 写入的四条纪律（先查再写 / 删过期 / 明确即办 / 元信息同步）
+
+索引快照（上下文，context）：
+  1. 用户级 MEMORY.md 索引（>1 天带 updated 属性）
+  2. 项目级 MEMORY.md 索引（同上）
 ```
 
 **只注入索引，不注入分类文件全文。** 模型命中描述后自行 `read` 对应文件。
+
+**纪律段是常量，随 section 每步都在** —— 但它逐字节恒定，KV Cache 命中，
+不产生新消息；也**不随索引变化重发**（这是 2026-09-14 第三次修订修正的问题）。
+
+**后台总结侧另有两件**（都是独立 LLM 调用，看不到上面这些）：
+
+1. `SUMMARY_SYSTEM` 里的一份防重复规则；
+2. 附在 user 消息末尾的**已有记忆清单**（`memoryManifestFor()`）——
+   机械保障，模型据此判断该覆盖哪个文件。
 
 **索引用标签裹住，给模型确定性。** 每份索引包在 `<memory-index scope="global|project" cwd="…">`
 里 —— 模型不必靠上下文猜这段文本的边界与作用域：
@@ -246,13 +276,43 @@ ctx.inject(['systemPrompt'], (scope) => {
 
 | # | 项 | 状态 |
 |---|---|---|
-| 1 | **索引说明** —— 这是记忆索引，按需读取原文 | ✅ 协议段（`MEMORY_PROTOCOL`） |
-| 2 | **搜索指引** —— 明确告知用什么工具、搜哪个目录 | ✅ 协议段说明「索引行是指针，读原文」，工具名见工具描述 |
-| 3 | **写入规则** —— 何时写、写哪种 type、负面清单 | ⚠️ 仍在 `memory_md_save` 工具描述里，**未进协议段** |
-| 4 | **角色边界** —— 记忆是补充，不替代正常回答 | ✅ 协议段末两条（静默应用、不凌驾于当前请求） |
+| 1 | **索引说明** —— 这是记忆索引，按需读取原文 | ✅ 协议段（`MEMORY_PROTOCOL`）+ 纪律段「索引行只是指针」 |
+| 2 | **搜索指引** —— 明确告知用什么工具、搜哪个目录 | ✅ 纪律段写明「先看索引，命中后再读主题文件」与检索词要窄 |
+| 3 | **写入规则** —— 何时写、写哪种 type、负面清单 | ✅ **纪律段（`MEMORY_RULES`）**，见下 |
+| 4 | **角色边界** —— 记忆是补充，不替代正常回答 | ✅ 纪律段（静默应用、不凌驾于当前请求） |
 
-> 3 刻意留在工具描述：写入规则只在**要写入时**才需要，每回合都占提示词不划算。
-> 1、2、4 是「读到记忆时怎么处理」，所以进协议段。
+> **第 3 项已修订两次。**
+>
+> **第一次（2026-09-13）**：原先写「刻意留在工具描述」，理由是「写入规则只在要
+> 写入时才需要」。**这个理由不成立**：写入规则是**事前纪律** —— 模型得在
+> 「决定要不要写」的时刻就知道「先查再写」，等它已经调 `memory_md_save` 时才看到
+> 就晚了。工具描述只适合放「这个工具怎么调」。
+>
+> **第二次（2026-09-14）**：改到**系统提示词段**（`section()`，与
+> `MEMORY_PROTOCOL` 同段）。因为纪律是**纯常量** —— 按上面那条红线
+> （读盘吗？不读盘就进 section），它本来就该在这儿。此前的中间状态是
+> 与索引同走 `context()`，那会让常量随索引变化整段重发，是错的。
+
+### CodeBuddy 提示词吸收清单（2026-09-13）
+
+**准则：只要适用 DSH 的都吸收；依赖 CodeBuddy 具体工具特性或不适用 DSH 的不要。**
+
+| 吸收 | 内容 |
+|---|---|
+| ✅ | 按主题而非时间组织（`Organize memory semantically by topic, not chronologically`） |
+| ✅ | 更新或删除过期/错误的记忆 |
+| ✅ | **写前先查，避免重复**（`First check if there is an existing memory you can update`） |
+| ✅ | 用户明确要求记住 → 立即保存，不等多次交互 |
+| ✅ | 用户要求忘记 → 找到并删除相关条目 |
+| ✅ | 用户纠正了从记忆里说出的说法 → **必须**改掉或删掉那一条 |
+| ✅ | 写前先核实，不凭一份文件下结论 |
+| ✅ | 正面清单（什么值得存）+ 负面清单（什么不该存），**成对出现** |
+
+| 排除 | 原因 |
+|---|---|
+| ❌ | `write to it directly with the Write tool` / `Use the Write and Edit tools` —— 依赖其通用文件工具；我们的模型**不能传路径**，写盘由插件走 Host 侧 fs |
+| ❌ | grep `*.jsonl` 会话转录（`Session transcript logs (last resort)`）—— DSH 的会话日志是 `session.jsonl.zstd` 压缩格式，直接 grep 不可行 |
+| ❌ | `Anything that duplicates or contradicts existing CODEBUDDY.md instructions` —— 依赖其项目指令文件；DSH 的对等场景由 preset 停用机制整体让位覆盖 |
 
 ---
 
@@ -623,7 +683,7 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
 - [x] 实现路径解析（global / 项目级）—— `src/context.mjs` 的 `resolveScopes()`
 - [x] 实现索引读取 + 行数限制 —— `src/inject.mjs` 的 `readIndex()`，200 行 / 4e4 字符
 - [x] 实现注入提示词 —— 协议段 `MEMORY_PROTOCOL`（`src/inject.mjs`）；
-      搜索指引与写入规则按 §6 的判定留在工具描述里
+      行为纪律见下面「CodeBuddy 提示词吸收」一节（落点已由工具描述改为注入快照）
 
 ### 本轮新增（2026-09-13 定案 → 已实施）
 
@@ -647,11 +707,66 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
       实测 transcript 体积减少 72.4%
 - [x] **日志内容加详**（§7.3）—— 补正面清单、放宽语境错配的负面清单、`MAX_OUTPUT_TOKENS` 2000→4000
 
+### 本次新增（2026-09-13 CodeBuddy 提示词吸收）
+
+- [x] **行为纪律 `MEMORY_RULES` 进系统提示词段**（§6）—— 吸收 CodeBuddy 提示词里适用
+      DSH 的部分（先查再写、删过期、按主题组织、明确要求即办、纠正即改、写前核实，
+      含成对的正/负面清单）。它是**纯常量**，与 `MEMORY_PROTOCOL` 同走 `section()`
+- [x] **新增 `memory_md_forget` 工具** —— 删除单条记忆（正文 + 索引行）；
+      配套 `store.mjs` 的 `removeIndexLine()` / `deleteMemory()`。
+      此前 B5「删除过期记忆」与 E3「纠正即改」**没有可执行的工具**，
+      规则写进去也做不到
+- [x] **后台路径同步防重复**（§7）—— `SUMMARY_SYSTEM` 补：看不到记忆库已有什么、
+      只写本段对话新出现的明确事实、宁可漏记不要重复记；并明确 `<memory-index>`
+      是已有记忆的索引、**不是用户说过的话**（防自我喂养）
+- [x] **工具描述升级为「先查再写」** —— `memory_md_save` 的 description 明确
+      写前先用 search/read 查一遍
+
+### 第二轮吸收（2026-09-14 全面分析 CodeBuddy 后）
+
+背景：对 `dist/codebuddy.js` 做了一次系统性实读（注入层 `:5694xxx`、后台抽取层
+`:7631xxx`、typed 提示词层 `:7935xxx`），发现三处此前遗漏的机制。
+
+- [x] **typed 四要素进规则**（§6）—— CodeBuddy 的 typed 路径给每一类记忆写了
+      `<description>` / `<when_to_save>` / `<how_to_use>` / `<examples>`
+      （feedback 与 project 另有 `<body_structure>`）。我们此前只有类型名枚举。
+      现已补进 `MEMORY_RULES`：四类各自的「何时写 / 怎么写 / 为什么」，
+      含 *纠正和认可都要记*、*feedback/project 要写 `**Why:**` 与 `**How to apply:**`*、
+      *相对日期必须转绝对日期*。`<examples>` 未逐条照搬（见下「未吸收」）
+- [x] **`## When to access memories` 的等价规则** —— 含两条我们完全没有的：
+      *用户明确要求回忆时必须去查*、*用户说"别用记忆"时就当作记忆是空的*
+- [x] **`## Before recommending from memory` 的等价规则** —— 新增「⚠️ 记忆不等于
+      当前事实」一节：点名 file/function 前先验证、与当前代码冲突时以观察为准、
+      并把过期那条改掉或删掉
+- [x] **manifest 机制（机械防重复）** —— 新增 `store.mjs` 的
+      `scanMemoryManifest()` / `formatMemoryManifest()`，后台总结时把
+      global + project 两个作用域的已有条目清单（带 `[scope]`、类型、文件名、
+      年龄、描述）附在 user 消息末尾。这是吸收 CodeBuddy `buildExtractPrompt()`
+      的 "## Existing memory files" 做法 —— **把"别写重复"从叮嘱变成有依据的判断**
+- [x] **记忆新鲜度** —— 索引文件的标签在超过 1 天时带 `updated="N 天前"`。
+      吸收 CodeBuddy `memoryFreshnessText()`，但改成标签属性而非独立一句话
+- [x] **`What NOT to save` 的补充** —— *即使用户明确要求存，那几类也不该原样存；
+      用户让记 PR 列表时先问哪一点是反直觉的*
+- [x] **frontmatter 只读文件头** —— `FRONTMATTER_HEAD_CHARS = 2000`，
+      对应 CodeBuddy 的 `readFileHead()`：manifest 只要三个字段，不必读完整正文
+
+**未吸收（附理由）**：
+
+| 未吸收 | 理由 |
+|---|---|
+| `<examples>` 逐条照搬 | 那些例子是英文的通用编码场景（data scientist、Linear、Grafana），与中文 DSH 语境错配；四类的判据已用中文写清，例子留白让模型自行归纳 |
+| `Use the Write and Edit tools` / `write to it directly with the Write tool` | 依赖 CodeBuddy 的通用文件工具；我们的模型**不能传路径** |
+| grep `*.jsonl` 会话转录 | DSH 的会话日志是 `session.jsonl.zstd` 压缩格式，直接 grep 不可行 |
+| 语义召回（`memory-selector` + `injectRelevantMemories`） | 已定案「一期不做」（见 `docs/memory-scheme-codebuddy.md`）；且它需要额外的 LLM 调用与索引基础设施 |
+| 子代理形态的抽取（`MemoryExtractionService` 用真子代理） | 我们的独立 `llm.stream()` 无工具、不建 session、不递归 —— 更简单且规避了递归风险 |
+| 冻结快照 `(0,nn.VU)(...)` | CodeBuddy 因为不热重载才需要；我们每次装配重读磁盘 |
+| 按 mtime 只取最近 N 个文件喂 manifest | 我们的 `MANIFEST_MAX_ENTRIES = 200` 已经够用；它的截断是为控制子代理提示词体积 |
+
 ### 原有待办（续）
 
 - [x] 实现留痕开关与 `.journal` 写入
 - [x] 实现 UI 配置项
-- [x] 写测试（12 个套件，含新增 `inject` / `summarize`；`remind` 套件已由 `summarize` 取代）
+- [x] 写测试（15 个套件，含新增 `inject` / `summarize`；`remind` 套件已由 `summarize` 取代）
 - [x] 同步更新 `README.md`：按定案改写「三个不」为「三条设计要点」
 
 ### 明确不做

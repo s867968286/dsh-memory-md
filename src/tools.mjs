@@ -24,9 +24,10 @@ import { readSettings, resolvePaths } from './settings.mjs'
 import {
   appendJournalEntries,
   countEntries,
-  isSafeFile,
+  deleteMemory,
   listMemoryFiles,
   memoryFilePath,
+  normalizeMemoryFile,
   readText,
   slugify,
   timeStamp,
@@ -46,6 +47,7 @@ const TYPES = MEMORY_TYPES
 export const TOOL_WRITE = 'memory_md_save'
 export const TOOL_SEARCH = 'memory_md_search'
 export const TOOL_READ = 'memory_md_read'
+export const TOOL_FORGET = 'memory_md_forget'
 export const TOOL_JOURNAL = 'memory_md_journal'
 
 /**
@@ -151,6 +153,10 @@ export function registerMemoryTools({ tools, config, logger }) {
       '**不要存**：代码写法或文件结构（读仓库就知道）、git 历史、调试配方、',
       '临时状态、以及任何你没验证过的东西。除非用户明确要求，不要存密钥。',
       '',
+      '**写之前先查一遍**（用 memory_md_search 或 memory_md_read 的列表模式）：',
+      '已有条目能改就改 —— 传同一个 `file` 覆盖它，不要新建一条近似的。',
+      '发现旧条目是错的或过期了，也在这次一并改掉。',
+      '',
       `目录由插件决定（${config.hints?.dirs ?? '<记忆目录>'}），${MEMORY_ENTRYPOINT} 索引也由插件维护`,
       '—— 你只提供内容，**永远不要传路径**。要更新已有记忆就复用它的文件名，别新建近似重复的。',
     ].join('\n'),
@@ -224,9 +230,15 @@ export function registerMemoryTools({ tools, config, logger }) {
       const type = TYPES.includes(args.type) ? args.type : undefined
       if (type === undefined) throw new Error(`memory_md_save: 未知的类型 "${args.type}"`)
 
-      const requested = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined
-      if (requested !== undefined && !isSafeFile(requested)) {
-        throw new Error('memory_md_save: file 必须是不带目录的纯 .md 文件名')
+      // 归一化：索引里的链接带 `memory/` 前缀，模型自然会连前缀一起复制。
+      const requested = typeof args.file === 'string' && args.file.trim()
+        ? normalizeMemoryFile(args.file)
+        : undefined
+      if (args.file !== undefined && String(args.file).trim() && requested === undefined) {
+        throw new Error(
+          `memory_md_save: "${String(args.file).trim()}" 不是合法的记忆文件名。` +
+          `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,
+        )
       }
       const file = requested ?? `${type}_${slugify(args.name)}.md`
 
@@ -427,10 +439,18 @@ export function registerMemoryTools({ tools, config, logger }) {
         targets.push(['project', scopes.project.dir])
       }
 
-      const file = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined
+      const file = typeof args.file === 'string' && args.file.trim()
+        ? normalizeMemoryFile(args.file)
+        : undefined
+
+      if (args.file !== undefined && String(args.file).trim() && file === undefined) {
+        throw new Error(
+          `memory_md_read: "${String(args.file).trim()}" 不是合法的记忆文件名。` +
+          `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,
+        )
+      }
 
       if (file !== undefined) {
-        if (!isSafeFile(file)) throw new Error('memory_md_read: file 必须是不带目录的纯 .md 文件名')
         for (const [scope, dir] of targets) {
           const text = readText(memoryFilePath(dir, file))
           if (text !== undefined) return Promise.resolve({ entries: [], text })
@@ -458,6 +478,112 @@ export function registerMemoryTools({ tools, config, logger }) {
       card: 'generic',
       title: args.file ? `读取记忆：${args.file}` : '列出记忆',
       kind: 'read',
+    }),
+  })
+
+  /* -------------------- memory_md_forget -------------------- */
+
+  tool({
+    name: TOOL_FORGET,
+    description: [
+      '删除一条已保存的记忆（正文文件 + 索引行一起删）。',
+      '',
+      '**这是不可逆操作**，用在三种情况：用户明确要求忘记某事；',
+      '这条记忆被证明是错的；它已经过期、不再适用。',
+      '',
+      '删除前先确认删的是哪一条：用 memory_md_search 或 memory_md_read',
+      '的列表模式找到确切的文件名。**不要凭印象删** —— 文件名对不上时',
+      '这里会报错，而不是猜一个最像的删掉。',
+      '',
+      '如果只是内容需要修正、条目本身仍然成立，请改用 memory_md_save',
+      '传同一个 file 覆盖更新 —— 那是「纠正」，不是「忘记」。',
+    ].join('\n'),
+    parameters: {
+      scope: {
+        type: 'string',
+        required: true,
+        enum: ['global', 'project'],
+        description: '从哪个存储里删。',
+      },
+      file: {
+        type: 'string',
+        required: true,
+        description:
+          '要删除的记忆文件名（如 "feedback_testing.md"）。先用 memory_md_read 列表或 memory_md_search 拿到确切的文件名。',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file: { type: 'string', required: true },
+          scope: { type: 'string', required: true },
+          removed: { type: 'boolean', required: true },
+          // 删除前该条记忆的标题与描述 —— 让用户和模型都看到究竟删了什么。
+          name: { type: 'string', required: true },
+          description: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: value.removed
+            ? `已删除 ${value.scope} 记忆 ${value.file}（${value.name}）。`
+            : `${value.scope} 里没有 ${value.file}，什么都没删。`,
+        },
+      ],
+    },
+    execute(args, exec) {
+      assertPresetAllowed(config, exec, TOOL_FORGET)
+      const { paths, memoryRoot, scopes } = scopeDirs(config, exec)
+      assertEnabled(paths)
+      const dir = dirFor(args.scope, memoryRoot, scopes)
+      if (dir === undefined) {
+        throw new Error(
+          'memory_md_forget: 当前没有打开工作区，没有可删的项目级记忆。',
+        )
+      }
+
+      const file = typeof args.file === 'string' ? normalizeMemoryFile(args.file) : undefined
+      if (!file) {
+        throw new Error(
+          `memory_md_forget: "${String(args.file ?? '').trim()}" 不是合法的记忆文件名。` +
+          `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,
+        )
+      }
+
+      // 先读元信息：删除后就无法回报"删掉的是什么"了。
+      const raw = readText(memoryFilePath(dir, file))
+      if (raw === undefined) {
+        // 正文不在。索引里可能还留着死链，一并清掉，但如实回报"没删到正文"。
+        deleteMemory(dir, file)
+        return Promise.resolve({
+          file,
+          scope: args.scope,
+          removed: false,
+          name: file,
+          description: '',
+        })
+      }
+      const { data } = parseMemoryFrontmatter(raw)
+
+      deleteMemory(dir, file)
+      logger?.info?.(`[memory-md] 已删除 ${memoryFilePath(dir, file)}`)
+
+      return Promise.resolve({
+        file,
+        scope: args.scope,
+        removed: true,
+        name: titleOf(data, file),
+        description: data.description ?? '',
+      })
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `删除 ${args.scope} 记忆：${args.file}`,
+      kind: 'edit',
+      rawInput: { scope: args.scope, file: args.file },
     }),
   })
 

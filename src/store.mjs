@@ -9,10 +9,30 @@
  * 否则两次并发写会各自基于同一份旧内容拼接，后写的覆盖先写的。
  */
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import { MEMORY_ENTRYPOINT, parseMemoryFrontmatter } from './codebuddy-port.mjs'
+
+/**
+ * 生成 manifest 时每个文件最多读多少字符。
+ *
+ * manifest 只要 `name` / `description` / `type` 三个字段，它们都在文件头的
+ * frontmatter 里。正文可能有几 KB，全读进来纯属浪费 —— CodeBuddy 的
+ * `readFileHead()` 出于同一理由只读文件头。
+ *
+ * 取 2000：足够容纳一个写得很长的 description，又远小于典型正文。
+ */
+export const FRONTMATTER_HEAD_CHARS = 2000
+
+/**
+ * 一份 manifest 最多列多少条。
+ *
+ * 上限的意义是**控制喂给模型的提示词体积**，不是限制记忆总数 ——
+ * 记忆本身不设条数上限（超限由人工优化）。清单里只放最近改动的那些，
+ * 模型据此判断"是不是已经有类似的了"已经够用。
+ */
+export const MANIFEST_MAX_ENTRIES = 200
 
 /**
  * 文件名合法性。
@@ -23,6 +43,41 @@ import { MEMORY_ENTRYPOINT, parseMemoryFrontmatter } from './codebuddy-port.mjs'
  */
 const SAFE_FILE = /^[^/\\:*?"<>|]+\.md$/
 export const isSafeFile = (name) => SAFE_FILE.test(name) && !name.includes('..')
+
+/**
+ * 把模型给的 `file` 参数归一成**纯文件名**；不合法时返回 undefined。
+ *
+ * ## 为什么必须做这一步
+ *
+ * 我们自己写进索引的链接是**带 `memory/` 前缀**的（`writeMemory()` 那行
+ * `upsertIndexLine(..., \`${MEMORY_DIR}/${file}\`, ...)`），因为索引在作用域根、
+ * 正文在子目录，相对路径必须这么写才对得上。
+ *
+ * 但工具只接受纯文件名。于是模型**从索引里复制路径**这一最自然的用法
+ * 100% 失败 —— `isSafeFile('memory/foo.md')` 会因斜杠被拒。这不是模型手误，
+ * 是数据形态与工具契约不一致导致的系统性诱导。
+ *
+ * 因此读取端宽容：剥掉作用域目录前缀后仍然只认文件名。
+ *
+ * ## 为什么这不削弱安全
+ *
+ * `isSafeFile` 的本职是**防目录穿越**（见上方注释），不是要求调用方格式。
+ * 这里白名单式地只剥掉**恰好等于** `MEMORY_DIR/` 或 `./` 的前缀，
+ * 剥完**仍要过一遍 `isSafeFile`** —— `../../etc/passwd`、`a/b/c.md`
+ * 之类照旧被拒，`..` 检查也依然生效。
+ *
+ * @param raw - 模型传来的原始值。
+ * @returns 纯文件名，或 undefined（不合法/非字符串/空）。
+ */
+export function normalizeMemoryFile(raw) {
+  if (typeof raw !== 'string') return undefined
+  let name = raw.trim()
+  if (!name) return undefined
+  // 剥前导 `./` 与作用域目录前缀；只剥一层，剥完重新校验。
+  name = name.replace(/^\.\//, '')
+  if (name.startsWith(`${MEMORY_DIR}/`)) name = name.slice(MEMORY_DIR.length + 1)
+  return isSafeFile(name) ? name : undefined
+}
 
 /** 读文本；不存在或读失败返回 undefined。 */
 export const readText = (path) => {
@@ -142,6 +197,75 @@ export function listMemoryFiles(dir) {
 }
 
 /**
+ * 扫出某个作用域里已有的记忆条目，带元信息与修改时间。
+ *
+ * ## 为什么需要它
+ *
+ * **后台总结模型看不到记忆库** —— 它是独立 LLM 调用，只拿得到当轮转写。
+ * 没有这份清单，它只能靠"别写重复的"这类文字叮嘱自律，而无从知道到底
+ * 已经有什么。CodeBuddy 的做法是把这份清单喂给抽取子代理
+ * （`formatMemoryManifest()`），这里吸收同一机制。
+ *
+ * ## 为什么带 mtime
+ *
+ * 两个用途：
+ *   1. 按**最近修改**排序，让模型先看到最相关的条目；
+ *   2. 每条附**年龄**，让模型自己判断"这条是不是太久没更新了"。
+ *
+ * 只读文件头（`FRONTMATTER_HEAD_CHARS`）而不是全读：清单只需要
+ * `name` / `description` / `type` 三个字段，正文可能有几 KB，
+ * 全部读进来纯属浪费 —— CodeBuddy 的 `readFileHead()` 同理。
+ */
+export function scanMemoryManifest(dir, { limit = MANIFEST_MAX_ENTRIES, now = Date.now() } = {}) {
+  const memoryDir = join(dir, MEMORY_DIR)
+  const rows = []
+  for (const file of listMemoryFiles(dir)) {
+    const path = join(memoryDir, file)
+    let stat
+    try {
+      stat = statSync(path)
+    } catch {
+      continue
+    }
+    const head = readText(path)?.slice(0, FRONTMATTER_HEAD_CHARS) ?? ''
+    const { data } = parseMemoryFrontmatter(head)
+    rows.push({
+      file,
+      name: typeof data.name === 'string' && data.name ? data.name : file.replace(/\.md$/, ''),
+      description: typeof data.description === 'string' ? data.description : '',
+      type: data.type ?? '',
+      mtimeMs: stat.mtimeMs,
+      // 整天的年龄：0 = 今天，1 = 昨天，N = N 天前。
+      ageDays: Math.max(0, Math.floor((now - stat.mtimeMs) / 86_400_000)),
+    })
+  }
+  // 最近改动的排在前面 —— 那份清单是给模型看的，顺序本身就是信号。
+  rows.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return { entries: rows.slice(0, limit), total: rows.length, truncated: rows.length > limit }
+}
+
+/**
+ * 把 manifest 渲染成给模型看的一段纯文本。
+ *
+ * 格式贴近 CodeBuddy 的 `formatMemoryManifest()`：
+ *   `- [type] 文件名 (N 天前): 标题 — 描述`
+ *
+ * 没条目时返回空串 —— 调用方据此决定不注入这一节（"还没有任何记忆"
+ * 不需要专门说一句，模型看到清单为空自然就明白）。
+ */
+export function formatMemoryManifest(manifest) {
+  if (manifest === undefined || manifest.entries.length === 0) return ''
+  return manifest.entries
+    .map((e) => {
+      const age = e.ageDays === 0 ? '今天' : e.ageDays === 1 ? '昨天' : `${e.ageDays} 天前`
+      const type = e.type ? `[${e.type}] ` : ''
+      const name = e.name ? `${e.name}: ` : ''
+      return `- ${type}${e.file} (${age})${name ? ` ${name}` : ''}${e.description}`
+    })
+    .join('\n')
+}
+
+/**
  * 把一行追加到索引（不存在则创建并加标题）。
  *
  * `file` 是**相对作用域的链接路径**（如 `memory/user_x.md`）—— 索引在作用域根，
@@ -164,6 +288,54 @@ export function upsertIndexLine(indexPath, file, title, description) {
   }
   const trimmed = existing.replace(/\s*$/, '')
   writeAtomic(indexPath, `${trimmed}\n${line}\n`)
+}
+
+/**
+ * 从索引里删掉指向某个文件的条目行。
+ *
+ * 与 `upsertIndexLine()` 对称：那边按 `](file)` 匹配做原地替换，这里按同一
+ * 判据整行移除。**只删索引行，不动其他行** —— 标题、空行、以及别的条目
+ * 原样保留，人工加在索引里的说明文字不会被误伤。
+ *
+ * @returns 是否真的删掉了一行（false = 索引里本来就没有这条）。
+ */
+export function removeIndexLine(indexPath, file) {
+  const existing = readText(indexPath)
+  if (existing === undefined) return false
+  const lines = existing.split('\n')
+  const kept = lines.filter((l) => !l.includes(`](${file})`))
+  if (kept.length === lines.length) return false
+  writeAtomic(indexPath, kept.join('\n'))
+  return true
+}
+
+/**
+ * 删除一条记忆：正文文件 + 对应的索引行。
+ *
+ * **这是不可逆操作**，调用方（`memory_md_forget`）负责先确认目标存在并
+ * 把删掉的内容回报给模型 —— 用户和模型都得知道究竟删了什么。
+ *
+ * 索引行先删还是正文先删无所谓：两者都做，且都在同步路径里完成，
+ * 中间不会有人看到「正文没了但索引还在」的持久状态。
+ *
+ * @returns `{ removed: boolean, indexPath: string, bodyPath: string }`；
+ *          `removed` 为 false 表示正文与索引行都不存在（无可删）。
+ */
+export function deleteMemory(dir, file) {
+  const bodyPath = join(dir, MEMORY_DIR, file)
+  const indexPath = join(dir, MEMORY_ENTRYPOINT)
+  const hadBody = existsSync(bodyPath)
+
+  let removed = false
+  if (hadBody) {
+    rmSync(bodyPath, { force: true })
+    removed = true
+  }
+  // 正文可能已被人工删掉、索引行还在 —— 这种情况也要清索引，否则索引
+  // 会留下一条点开找不到文件的死链。
+  if (removeIndexLine(indexPath, `${MEMORY_DIR}/${file}`)) removed = true
+
+  return { removed, indexPath, bodyPath }
 }
 
 /**

@@ -113,7 +113,8 @@ check('路由 path', routes[0].path, '/memory-md')
 // 工具注册是异步的（defineTool 惰性解析），等一个微任务队列。
 await new Promise((resolve) => setTimeout(resolve, 50))
 console.log('\n工具注册')
-check('注册了四个记忆工具', toolNames.sort(), [
+check('注册了五个记忆工具', toolNames.sort(), [
+  'memory_md_forget',
   'memory_md_journal',
   'memory_md_read',
   'memory_md_save',
@@ -121,18 +122,37 @@ check('注册了四个记忆工具', toolNames.sort(), [
 ])
 check('名字都带 memory_md_ 前缀', toolNames.every((n) => n.startsWith('memory_md_')), true)
 
-console.log('\n两段式注入：协议进提示词段，索引进上下文快照')
-// 协议是常量，走 `systemPrompt.section()` —— DSH 每步重装提示词时结果不变，
-// 前缀 KV Cache 始终命中。
+console.log('\n两段式注入：常量进提示词段，读盘的索引进上下文快照')
+// 协议 + 行为纪律都是常量，走 `systemPrompt.section()` ——
+// DSH 每步重装提示词时结果不变，前缀 KV Cache 始终命中，且不产生新消息。
 check('注册了一个 section', sections.length, 1)
 check('section 名', sections[0]?.spec?.name, 'memory-md:protocol')
 check('section 有 order', typeof sections[0]?.spec?.order, 'number')
+// ★ 关键：section 的 text 必须对任意 assembly 返回**同一份常量**。
+// 它一旦读盘（例如把索引塞进来），整个提示词前缀的 KV Cache 就随文件变化失效
+// —— 含全部历史。这条断言把「常量」这个前提钉死。
+{
+  const spec = sections[0]?.spec
+  const a = typeof spec?.text === 'function' ? spec.text({ agent: undefined }) : spec?.text
+  const b = typeof spec?.text === 'function' ? spec.text({ agent: { id: 'other' } }) : spec?.text
+  check('section text 非空', typeof a === 'string' && a.length > 0, true)
+  check('section text 与 assembly 无关（纯常量）', a === b, true)
+  // 纪律确实在这个常量里 —— 它不能只出现在快照里。
+  check('section 含行为纪律', String(a).includes('写入的四条纪律'), true)
+}
 // 索引读盘、随记忆变化，走 `systemPrompt.context()` —— 追加在历史里，
 // 不吃提示词前缀；去重由 loop 的 RuntimeContextProjection 内建。
 check('注册了一个 context', contexts.length, 1)
 check('context 名', contexts[0]?.spec?.name, 'memory-md:index')
 check('context 有 order', typeof contexts[0]?.spec?.order, 'number')
 check('context text 是函数（每次装配重读）', typeof contexts[0]?.spec?.text, 'function')
+// ★ 反向断言：常量纪律**不得**出现在快照里，否则索引一变就带着它整段重发
+// （快照是追加而非替换，重发会永久占住会话历史）。
+{
+  const spec = contexts[0]?.spec
+  const text = typeof spec?.text === 'function' ? spec.text({ agent: undefined }) : (spec?.text ?? '')
+  check('context 里没有纪律（避免随索引重发）', String(text).includes('写入的四条纪律'), false)
+}
 
 console.log('\n订阅轮末后台总结')
 check('订阅了 turn-stopping', listeners.has('agent/turn-stopping'), true)

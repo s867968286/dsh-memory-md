@@ -8,20 +8,23 @@
 
 ## 一、设计要点
 
-### 1. 注入分两段：不变协议进提示词，易变索引进快照
+### 1. 注入分两段：常量进提示词，读盘的进快照
 
-记忆文本按生命周期分两类，走不同通道：
+记忆文本按**是否读盘**分两类，走不同通道：
 
 | | 内容 | 通道 | 为什么 |
 |---|---|---|---|
-| **协议** | 索引是什么、条目什么特征、边界在哪 | `systemPrompt.section()`（系统提示词） | 常量，逐字节恒定 → 前缀 KV Cache 始终命中 |
-| **索引** | 用户级 + 项目级 `MEMORY.md` | `systemPrompt.context()`（上下文快照） | 读盘、随记忆变化 → 不吃提示词前缀 |
+| **协议 + 行为纪律** | 索引是什么、怎么写记忆（先查再写、删过期、按主题组织、四类型判据……） | `systemPrompt.section()`（系统提示词） | **纯常量**，逐字节恒定 → 前缀 KV Cache 始终命中，**不产生新消息** |
+| **索引** | 用户级 + 项目级 `MEMORY.md` | `systemPrompt.context()`（上下文快照） | **读盘**、随记忆变化 → 进 section 会让整个前缀缓存失效 |
 
-关键约束：DSH 每个 step 都重新装配系统提示词（`dsh-agent-loop` 的 `systemPrompt.assemble()`）。任何**读盘的 prompt section** 都会让提示词随文件变化，整个前缀的 KV Cache 随之失效。所以只有**常量**才允许进 section。
+**两个方向的红线都成立：**
+
+- **读盘的内容绝不允许进 `section()`** —— DSH 每个 step 都重新装配系统提示词（`dsh-agent-loop` 的 `systemPrompt.assemble()`）。任何随文件变化的 section 都会让**整个前缀**的 KV Cache 失效（含全部历史）。
+- **常量不该混进 `context()`** —— 快照是**追加而非替换**。常量一旦和读盘内容捆在同一条快照里，读盘内容一变就把常量**整段重发**，而重发的那份**永久留在会话历史里**。常量放 `section()` 每步都在，但逐字节恒定 → 缓存命中，不产生新消息，**严格更优**。
 
 ```js
-// 协议：静态文本，写死在提示词里
-ctx.systemPrompt.section({ name: 'memory-md:protocol', order: 950, text: () => MEMORY_PROTOCOL })
+// 协议 + 纪律：静态常量，写死在提示词里
+ctx.systemPrompt.section({ name: 'memory-md:protocol', order: 950, text: () => memoryPromptText() })
 
 // 索引：每次装配重读；空串则不贡献
 ctx.systemPrompt.context({
@@ -31,7 +34,39 @@ ctx.systemPrompt.context({
 })
 ```
 
-早先把两段**都**放进 `context()`：协议文本于是在每次记忆变化时跟着重发一遍，而旧快照仍留在历史里（快照是追加而非替换），纯属浪费 token。拆开后，系统提示词里只有一份协议，快照里只有索引。
+实测体量：常量段 **2638 字符**（协议 230 + 纪律 2406），索引快照约 **1478 字符**。
+
+> **一段走过的弯路（已修正）**：行为纪律曾经被拼进 `renderMemoryIndex()` 的产物，与索引同走 `context()`。结果是规则一字未改，却因为和读盘的索引捆在同一条快照里，**索引一变就带着 2400 多字整段重发** —— 等于把常量的缺点（重发）和动态内容的缺点（耦合）都占了。当时给的理由是「让模型读到『有哪些记忆』的同时读到『该怎么对待』」，但那是个**读者便利**的考虑，代价却由每一轮请求承担。CodeBuddy 的原版犯同一个错（把规则与 `## Current MEMORY.md contents` 拼成一整块 `<memory>` 每次全量注入），不该照搬。
+
+早先把两段**都**放进 `context()` 时问题更严重：协议文本跟着每次记忆变化重发。
+
+### 行为纪律的内容与来源
+
+规则文本（`MEMORY_RULES`）吸收自 CodeBuddy 的记忆提示词，**只吸收适用于 DSH 的部分**：
+
+- **吸收**：按主题而非时间组织、更新或删除过期/错误记忆、**写前先查避免重复**、用户明确要求就立刻办、用户纠正了从记忆里说出的说法必须改掉、写前先核实。附正面清单（什么值得存）与负面清单（什么不该存）—— 两者成对，只给约束不给目标等于没给规则。
+- **吸收（typed 路径）**：四类记忆各自的「何时写 / 怎么写 / 为什么」（`## Types of memory` 的 `<when_to_save>` / `<how_to_use>` / `<body_structure>`）、「记忆不等于当前事实」（`## Before recommending from memory`）、「用户说别用记忆时当作空」（`## When to access memories`）。
+- **排除**：依赖 CodeBuddy 具体工具特性的说法（`write to it directly with the Write tool`、`Use the Write and Edit tools` —— 我们的模型**不能传路径**，写盘由插件走 Host 侧 fs）；grep `*.jsonl` 会话转录（DSH 的会话日志是 `session.jsonl.zstd` 压缩格式，直接 grep 不可行）；`<examples>` 逐条照搬（那些是英文通用编码场景，与中文 DSH 语境错配）。
+
+**为什么不能只放工具 description**：这是**事前纪律**，不是工具用法。模型得在**决定要不要写**的时刻就知道「先查再写」，等它已经调 `memory_md_save` 时才看到就晚了。工具 description 只适合放「这个工具怎么调」。
+
+
+**没有索引时不注入纪律** —— 一条记忆都没有时讲一堆纪律只是噪音。
+
+**后台总结也要防重复。** 后台总结是**独立 LLM 调用**，它看不到注入快照（快照进的是主对话）。所以：
+
+1. `SUMMARY_SYSTEM` 里有一份防重复规则：告诉它**看不到**记忆库、只写本段对话里新出现的明确事实、宁可漏记也不要重复记；并明确 `<memory-index>` 块是**已有记忆的索引**、不是用户说过的话 —— 否则它会据此再写一条重复记忆（自我喂养）。
+2. **消息末尾附上「已有的记忆」清单**（`memoryManifestFor()`）—— 这是**机械保障**，不是叮嘱。清单里每条带 `[scope]` 前缀、类型、文件名、年龄与描述，模型据此判断"是不是已经有同一件事的条目，该覆盖哪个文件"。
+
+> 只叮嘱不喂清单是没用的：模型无从知道已经有什么。这一招吸收自 CodeBuddy 的 `buildExtractPrompt()` —— 它把 `formatMemoryManifest(scanMemoryFiles(dir))` 作为 "## Existing memory files" 一节喂给抽取子代理。
+
+**索引超过 1 天会带年龄属性。** 索引是一份**快照**，记的是写下那一刻的记忆库状态。所以旧索引的标签会多一个 `updated` 属性：
+
+```xml
+<memory-index scope="global" updated="10 天前">
+```
+
+当天/昨天的不附（不存在"过期"问题，挂了只是噪音）。机制吸收自 CodeBuddy 的 `memoryFreshnessText()` —— 那边是注入时附一句 *"This memory is N days old … Verify against current code before asserting as fact."*；这里改成标签属性，因为它天然属于这份索引，模型不必再读一句话去对应它是说给谁听的。规则段里有配套的行为要求（见下）。
 
 **去重是白拿的。** `dsh-agent-loop` 的 `RuntimeContextProjection.project()` 会比对上一次保留的快照文本，**内容未变则不产生任何消息** —— 所以「索引变了才注入、没变就不重复注入」由 loop 负责，插件不需要自己做跳过机制。
 
@@ -91,7 +126,7 @@ D:\workspaces\ai\dsh-memory-md\memory_test.md
 
 ## 二、工具
 
-**四个工具**，**写入规范**写在 description 里；**记忆是什么**归提示词段的协议。
+**五个工具**，**写入规范**写在 description 里；**记忆是什么、该怎么对待记忆**归提示词段的协议与快照里的行为纪律。
 
 ### `memory_md_save`
 
@@ -115,6 +150,26 @@ D:\workspaces\ai\dsh-memory-md\memory_test.md
 ### `memory_md_read`
 
 省略 `file` 则列出所有记忆（标题 / 类型 / 描述）；给了 `file` 则读全文。
+
+### `memory_md_forget`
+
+**删除**一条记忆 —— 正文文件与索引行一起删。用在三种情况：用户明确要求忘记某事；
+这条记忆被证明是错的；它已经过期、不再适用。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `scope` | ✅ | 从哪个存储里删 |
+| `file` | ✅ | 要删的文件名（先用 `memory_md_read` 列表或 `memory_md_search` 拿到确切名字） |
+
+**这是不可逆操作**，所以：
+
+- 文件名对不上时**报错**，而不是猜一个最像的删掉；
+- 删除后**回报被删条目的标题与描述**，用户和模型都看得到究竟删了什么；
+- 重复删除是幂等的（返回 `removed: false`，不抛错）；
+- 接口只会**删单条**，没有「清空全部」这种批量入口。
+
+内容需要修正、条目本身仍成立时，应当用 `memory_md_save` 传同一个 `file`
+**覆盖更新** —— 那是「纠正」，不是「忘记」。
 
 ### `memory_md_journal`
 

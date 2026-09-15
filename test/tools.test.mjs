@@ -8,12 +8,12 @@
  */
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 const SANDBOX = join(tmpdir(), `mmd-tools-${process.pid}`)
 process.env.DSH_HOME = SANDBOX
 
-const { registerMemoryTools, TOOL_WRITE, TOOL_SEARCH, TOOL_READ, TOOL_JOURNAL } = await import('../src/tools.mjs')
+const { registerMemoryTools, TOOL_WRITE, TOOL_SEARCH, TOOL_READ, TOOL_FORGET, TOOL_JOURNAL } = await import('../src/tools.mjs')
 
 // 插件自己转 schema（不用 defineTool），所以这里注册器拿到的已是 JSON Schema。
 
@@ -77,7 +77,11 @@ try {
   })
 
   console.log('\n工具注册')
-  check('四个工具都注册了', [...registered.keys()].sort(), [TOOL_JOURNAL, TOOL_READ, TOOL_WRITE, TOOL_SEARCH].sort())
+  check(
+    '五个工具都注册了',
+    [...registered.keys()].sort(),
+    [TOOL_JOURNAL, TOOL_READ, TOOL_WRITE, TOOL_SEARCH, TOOL_FORGET].sort(),
+  )
   check('全部带 memory_md_ 前缀', [...registered.keys()].every((n) => n.startsWith('memory_md_')), true)
   check('save 的参数是 JSON Schema', registered.get(TOOL_WRITE).parameters.type, 'object')
   check(
@@ -305,6 +309,51 @@ try {
     }
 
     writeSettings(rp(SANDBOX), { journal: false })
+  }
+
+  console.log('\nmemory_md_forget 删除记忆')
+  {
+    const forget = registered.get(TOOL_FORGET)
+    const saved = await registered.get(TOOL_WRITE).execute(
+      { scope: 'project', type: 'project', name: '待删除的条目', description: '马上就删', content: '正文。' },
+      exec,
+    )
+    check('先写入一条', saved.created, true)
+
+    const indexPath = join(dirname(saved.path), '..', 'MEMORY.md')
+    const before = readFileSync(indexPath, 'utf8')
+    check('索引里有这一行', before.includes(`](${saved.file.split('/').pop()})`) || before.includes(saved.file), true)
+
+    const gone = await forget.execute({ scope: 'project', file: saved.file }, exec)
+    check('删除了', gone.removed, true)
+    check('回报了标题', gone.name, '待删除的条目')
+    check('回报了描述', gone.description, '马上就删')
+    check('正文文件已消失', existsSync(saved.path), false)
+
+    const after = readFileSync(indexPath, 'utf8')
+    check('索引行也清掉了', after.includes('待删除的条目'), false)
+    check('索引其余内容仍在', after.startsWith('# MEMORY.md'), true)
+
+    // 重复删除：正文与索引行都不在了 —— 如实回报没删到，而不是抛错。
+    const again = await forget.execute({ scope: 'project', file: saved.file }, exec)
+    check('重复删除是幂等的', again.removed, false)
+
+    // 路径穿越与非法文件名必须被拒。
+    check(
+      '拒绝带目录的文件名',
+      await throwsSync(() => forget.execute({ scope: 'project', file: '../evil.md' }, exec)),
+      true,
+    )
+    check(
+      '拒绝非 .md 文件名',
+      await throwsSync(() => forget.execute({ scope: 'project', file: 'evil.txt' }, exec)),
+      true,
+    )
+    check(
+      '空 file 报错',
+      await throwsSync(() => forget.execute({ scope: 'project', file: '  ' }, exec)),
+      true,
+    )
   }
 
   console.log('\n总开关关闭时拒绝写入')

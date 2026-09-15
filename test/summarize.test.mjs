@@ -366,6 +366,50 @@ try {
     check('同一轮不重复总结', llmCalls.length, 0)
   }
 
+  // ⭐ 已有记忆清单（吸收 CodeBuddy 的 formatMemoryManifest 机制）。
+  //
+  // 后台模型**看不到记忆库** —— 它是独立 LLM 调用，只拿得到当轮转写。
+  // 没有这份清单，"别写重复的"就只是一句它无从执行的叮嘱。
+  console.log('\n已有记忆清单喂给后台模型（防重复的机械保障）')
+  {
+    llmCalls.length = 0
+    appended.length = 0
+    resetForTest()
+    writeSettings(paths, { enabled: true, journal: true, disabledPresets: [] })
+
+    // 上一段测试已经写过一条 global 记忆。
+    session = makeSession(turnEvents(3))
+    listener({ agent, turn: 3 })
+    await settle()
+
+    check('调用了 LLM', llmCalls.length, 1)
+    const sent = llmCalls[0]?.messages?.[0]?.content?.[0]?.text ?? ''
+    check('消息里附了「已有的记忆」小节', sent.includes('## 已有的记忆'), true)
+    // 清单必须真的含刚才那条（带 scope 前缀，模型据此知道该往哪写）。
+    check('清单含已有条目的文件名', sent.includes('feedback_不要拿插件文档当需求真源.md'), true)
+    check('清单带 scope 前缀', sent.includes('[global]'), true)
+    // 叮嘱要与清单呼应 —— 指向清单，而不是空口说"别写重复"。
+    check('指明了先看清单', sent.includes('写之前先看这里'), true)
+  }
+
+  console.log('\nmanifest 扫描：按修改时间排序、带类型与年龄')
+  {
+    const { scanMemoryManifest, formatMemoryManifest: fmt } = await import('../src/store.mjs')
+    const m = scanMemoryManifest(join(paths.memoryRoot, 'global'))
+    check('扫到了条目', m.entries.length > 0, true)
+    check('每条都有 ageDays', m.entries.every((e) => typeof e.ageDays === 'number'), true)
+    check('每条都有 file 名', m.entries.every((e) => typeof e.file === 'string' && e.file.endsWith('.md')), true)
+    // 按 mtime 倒序 —— 最近改动的排前面。
+    const sorted = m.entries.every((e, i) => i === 0 || m.entries[i - 1].mtimeMs >= e.mtimeMs)
+    check('按 mtime 倒序', sorted, true)
+    // 渲染出来的行要带类型标记与文件名。
+    const line = fmt(m).split('\n')[0]
+    check('渲染行含类型标记', /- \[\w+\] /.test(line), true)
+    check('渲染行含 .md 文件名', line.includes('.md'), true)
+    // 空清单渲染成空串 —— 调用方据此不注入那一节。
+    check('空清单渲染为空串', fmt({ entries: [], total: 0, truncated: false }), '')
+  }
+
   // ⭐ 回归：记忆工具调用抑制总结的判据，只能看**本轮**（2026-09-14）。
   //
   // 真实事故：preset-md 作用域的会话有 7 轮，日志却停在 00:40 —— 因为判据传的是

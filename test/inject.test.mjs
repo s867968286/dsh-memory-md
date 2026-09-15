@@ -7,7 +7,8 @@
  *   3. 两份都没有时返回空串 —— 官方约定空文本不贡献 section，
  *      也就不会产生任何历史消息；
  *   4. 索引用 `<memory-index scope="…">` 标签裹住，边界与作用域对模型明确；
- *   5. 索引超限时截断（`truncateEntrypointContent`，200 行 / 4e4 字符）。
+ *   5. 索引超限时截断（`truncateEntrypointContent`，200 行 / 4e4 字符）；
+ *   6. **行为纪律（`MEMORY_RULES`）与索引同走快照** —— 但只在真有索引时才注入。
  *
  * 协议（`MEMORY_PROTOCOL`）不在快照里 —— 它走 `systemPrompt.section()`
  * （系统提示词段），由 `load.test.mjs` 验证注册。这里只验证它不含易变内容。
@@ -15,14 +16,15 @@
  * 去重（内容未变不重复注入）由 `dsh-agent-loop` 的 `RuntimeContextProjection`
  * 负责，不在本模块 —— 所以这里不测去重。
  */
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const SANDBOX = join(tmpdir(), `mmd-inject-${process.pid}`)
 process.env.DSH_HOME = SANDBOX
 
-const { renderMemoryIndex, readIndex, MEMORY_PROTOCOL } = await import('../src/inject.mjs')
+const { renderMemoryIndex, readIndex, MEMORY_PROTOCOL, MEMORY_RULES, memoryPromptText } = await import('../src/inject.mjs')
+const PROMPT_TEXT = memoryPromptText()
 const { resolvePaths } = await import('../src/settings.mjs')
 const { resolveScopes } = await import('../src/context.mjs')
 const { MEMORY_ENTRYPOINT } = await import('../src/codebuddy-port.mjs')
@@ -98,6 +100,84 @@ try {
     // 常量里绝不能出现 {{ —— 那会在 assemble() 里抛错、炸掉整个回合。
     // 这条断言是「防未来」：有人往协议里加占位符语法时立刻失败，而不是线上爆炸。
     check('协议不含 {{（否则炸整轮）', /\{\{/.test(MEMORY_PROTOCOL), false)
+  }
+
+  console.log('\n行为纪律进系统提示词段（常量 → section，不随索引重发）')
+  {
+    // ★ 落点断言：纪律**不在快照里** —— 它是常量，混进 context 会让它
+    //   随索引每次变化整段重发（快照是追加而非替换）。
+    const text = render()
+    check('快照不含纪律', text.includes('写入的四条纪律'), false)
+    check('快照只有索引块', text.trimStart().startsWith('<memory-index'), true)
+    check('快照不含 {{（否则炸整轮）', /\{\{/.test(text), false)
+
+    // 而它确实在 section 用的那段常量文本里。
+    check('提示词段含写入纪律', PROMPT_TEXT.includes('写入的四条纪律'), true)
+    check('提示词段含协议', PROMPT_TEXT.includes('## 长期记忆'), true)
+    check('协议在纪律之前', PROMPT_TEXT.indexOf('## 长期记忆') < PROMPT_TEXT.indexOf('写入的四条纪律'), true)
+    check('讲了先查再写', PROMPT_TEXT.includes('memory_md_search'), true)
+    check('讲了删除工具', PROMPT_TEXT.includes('memory_md_forget'), true)
+    check('讲了按主题组织', PROMPT_TEXT.includes('按主题组织'), true)
+    // 常量里绝不能出现 {{ —— 它同样过官方 interpolate()。
+    check('纪律不含 {{（否则炸整轮）', /\{\{/.test(MEMORY_RULES), false)
+    check('提示词段不含 {{（否则炸整轮）', /\{\{/.test(PROMPT_TEXT), false)
+    // 反面：排除了依赖 CodeBuddy 工具特性的说法。
+    check('没照搬 Write 工具说法', /Write tool|Write and Edit/.test(MEMORY_RULES), false)
+    // 反面：排除了 grep *.jsonl 会话转录（DSH 是 zstd 压缩，不可行）。
+    check('没照搬 jsonl 检索', PROMPT_TEXT.includes('.jsonl'), false)
+  }
+
+  console.log('\ntyped 四要素与「记忆不等于事实」（吸收 CodeBuddy typed 提示词）')
+  {
+    const text = PROMPT_TEXT
+    // 四类各自的判据都要在 —— 只给类型名模型选不对。
+    check('user 何时写', text.includes('了解到用户的角色、偏好、职责'), true)
+    check('feedback 纠正与认可都要记', text.includes('纠正和认可都要记'), true)
+    check('project 相对日期转绝对', text.includes('相对日期必须转成绝对日期'), true)
+    check('reference 只记指针', text.includes('写成"去哪找"的指针'), true)
+    // body_structure：feedback/project 要有 Why / How to apply。
+    check('feedback 有 Why/How to apply', text.includes('**Why:**') && text.includes('**How to apply:**'), true)
+    // Before recommending from memory 的等价规则。
+    check('讲了记忆不等于当前事实', text.includes('记忆不等于当前事实'), true)
+    check('代码冲突时以观察为准', text.includes('以现在观察到的为准'), true)
+    // When to access memories 的等价规则。
+    check('用户说别用记忆时当空', text.includes('就当作记忆是空的'), true)
+    check('明确要求回忆时必须查', text.includes('必须去查'), true)
+  }
+
+  console.log('\n索引新鲜度：旧索引带 updated 属性（吸收 memoryFreshnessText）')
+  {
+    // 今天的索引不该带 updated —— 当天索引不存在"过期"问题，挂了只是噪音。
+    check('今天的索引不带 updated', /<memory-index[^>]*updated=/.test(render()), false)
+
+    // 把 global 索引的 mtime 拨回 10 天前 → 该块应带 updated="10 天前"。
+    const globalIndexPath = join(GLOBAL_DIR, MEMORY_ENTRYPOINT)
+    const tenDaysAgo = new Date(Date.now() - 10 * 86_400_000)
+    utimesSync(globalIndexPath, tenDaysAgo, tenDaysAgo)
+
+    const text = render()
+    check('旧索引带 updated', /<memory-index[^>]*updated="10 天前"/.test(text), true)
+    // 项目级那份是刚写的 → 不该带。
+    const projectBlock = text.slice(text.indexOf('scope="project"'))
+    check('同一份快照里，新的索引不带 updated', /<memory-index[^>]*updated=/.test(projectBlock), false)
+    // 属性不能破坏标签本身的结构（模型靠它辨认边界）。
+    check('标签仍然完整闭合', text.includes('</memory-index>'), true)
+
+    // 还原成今天，免得影响后续用例。
+    const now = new Date()
+    utimesSync(globalIndexPath, now, now)
+  }
+  console.log('\n没有索引 → 快照为空（不注入任何东西）')
+  {
+    rmSync(join(GLOBAL_DIR, MEMORY_ENTRYPOINT), { force: true })
+    rmSync(join(PROJECT_DIR, MEMORY_ENTRYPOINT), { force: true })
+    const empty = render()
+    check('返回空串', empty, '')
+    // 纪律在 section 里，与快照无关 —— 快照空不影响它。
+    check('纪律仍完整存在于提示词段', PROMPT_TEXT.includes('写入的四条纪律'), true)
+    // 还原，后续用例需要索引。
+    write(GLOBAL_DIR, MEMORY_ENTRYPOINT, '# MEMORY.md\n\n- [用户偏好](user_x.md) — 用中文回复\n')
+    write(PROJECT_DIR, MEMORY_ENTRYPOINT, '# MEMORY.md\n\n- [数据库端口](reference_db.md) — 跑在 5433\n')
   }
 
   console.log('\n去掉索引文件自己的 # MEMORY.md 标题（避免与标签重复）')

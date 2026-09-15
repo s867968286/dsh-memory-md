@@ -4,10 +4,12 @@
  * 纯本地 Markdown 记忆。对外提供两件东西：
  *
  * 1. **`memory_md_*` 工具** —— 模型主动读写记忆的通道；
- * 2. **两段式记忆注入** —— 不变的协议进系统提示词段（`systemPrompt.section()`），
- *    易变的 `MEMORY.md` 索引进运行期上下文快照（`systemPrompt.context()`），
- *    模型不必先调工具就知道有什么记忆。拆开是因为两者生命周期不同：协议是
- *    常量，读盘的只有索引；混在一起会让协议跟着每次记忆变化重发一遍。
+ * 2. **两段式记忆注入** —— 不变的部分（协议 + 行为纪律，纯常量）进系统提示词段
+ *    （`systemPrompt.section()`），易变的 `MEMORY.md` 索引进行期上下文快照
+ *    （`systemPrompt.context()`），模型不必先调工具就知道有什么记忆。
+ *    拆开是因为两者生命周期不同：**常量进 section 逐字节恒定、KV Cache 命中、
+ *    不产生新消息；读盘的索引进 context，变了才追加。** 把常量混进 context 会
+ *    让它随索引变化反复重发；把读盘内容混进 section 会让整个前缀缓存失效。
  *
  * 轮末另有**后台异步 LLM 总结**（`summarize.mjs`），由它写记忆与日志 ——
  * 不往主对话塞消息，因此对话里看不到任何提醒。
@@ -23,7 +25,7 @@ import {
   writeSettings,
 } from './settings.mjs'
 import { ROUTE_PREFIX, registerRoutes } from './routes.mjs'
-import { MEMORY_PROTOCOL, renderMemoryIndex } from './inject.mjs'
+import { memoryPromptText, renderMemoryIndex } from './inject.mjs'
 import { registerMemoryTools } from './tools.mjs'
 import { createTurnStoppingListener, forgetSession } from './summarize.mjs'
 
@@ -145,7 +147,14 @@ export function apply(ctx, config = {}) {
       return true
     }
 
-    // (1) 协议段：静态文本，进系统提示词。
+    // (1) 提示词段：静态文本，进系统提示词。
+    //
+    // 内容是**协议 + 行为纪律**，两者都是纯常量（一个字节都不读盘）——
+    // 所以逐字节恒定，DSH 每个 step 重装提示词时结果不变，前缀 KV Cache 始终命中，
+    // 且**不会往会话历史里追加任何消息**。
+    //
+    // 反之，读盘的索引绝不能放这里：任何随文件变化的 section 都会让整个前缀
+    // 的 KV Cache 失效（含全部历史）。索引因此走下面的 `context()`。
     //
     // 用 950 这个空档：在文件引用段（900）之后、工具说明段（1000+）之前，
     // 读起来是"先讲记忆是什么，再讲有哪些工具"。不占人设段（0）或身份段
@@ -153,10 +162,14 @@ export function apply(ctx, config = {}) {
     scope.systemPrompt.section({
       name: 'memory-md:protocol',
       order: 950,
-      text: (assembly) => (shouldInject(assembly) ? MEMORY_PROTOCOL : ''),
+      text: (assembly) => (shouldInject(assembly) ? memoryPromptText() : ''),
     })
 
     // (2) 索引快照：易变，走 context()。
+    //
+    // **只放索引** —— 它读盘、随记忆增删而变，所以不能进 section（见上）。
+    // 纪律是常量，已在上面的 section 里，不在这里重复：曾经拼在这里，
+    // 结果是索引一变就把 2400 多字的常量规则带着整段重发（快照是追加而非替换）。
     scope.systemPrompt.context({
       name: 'memory-md:index',
       // 外部贡献可用任意有限 order。放在官方三项（沙箱 110 / 审批 115 /
