@@ -124,6 +124,7 @@ window.__ModuleLoader__.load({
       const form = draft ?? {
         enabled: saved.enabled,
         journal: saved.journal,
+        freezeIndex: saved.freezeIndex,
         minReviewTurns: String(saved.minReviewTurns ?? ''),
         minReviewChars: String(saved.minReviewChars ?? ''),
         disabledPresets: (saved.disabledPresets ?? []).join('\n'),
@@ -134,6 +135,7 @@ window.__ModuleLoader__.load({
       const dirty =
         form.enabled !== saved.enabled ||
         form.journal !== saved.journal ||
+        form.freezeIndex !== saved.freezeIndex ||
         form.minReviewTurns !== String(saved.minReviewTurns ?? '') ||
         form.minReviewChars !== String(saved.minReviewChars ?? '') ||
         form.disabledPresets !== (saved.disabledPresets ?? []).join('\n')
@@ -146,6 +148,7 @@ window.__ModuleLoader__.load({
           const data = await call('/settings', json('PUT', {
             enabled: form.enabled,
             journal: form.journal,
+            freezeIndex: form.freezeIndex,
             // ⚠️ 清空时提交 **null**，不能提交 undefined ——
             // `JSON.stringify({k: undefined})` 会把键整个丢掉，服务端收到的是空对象，
             // 于是「清空即用默认」根本不会发生（用户以为重置了，实际没变）。
@@ -238,6 +241,9 @@ window.__ModuleLoader__.load({
           setRow('journal', '工作留痕',
             '开：每轮结束后台总结把做过的事追加记到当前工作区当天的日志里，供你事后翻看。' +
             '关：不写日志。日志只写不读，永远不会被当成记忆加载。'),
+          setRow('freezeIndex', '冻结记忆索引',
+            '开：同一对话只注入一次索引，之后不再重复注入（记忆文件变了也不追加），省上下文。' +
+            '想刷新记忆时把开关关一下再打开。关：索引一变就注入最新的一份。'),
           // 双阈值：任一达标即触发一次后台总结（两者是「或」关系）。
           h('div', { className: 'mmd-fields' },
             num('minReviewTurns', '触发轮数', '轮'),

@@ -146,6 +146,7 @@ try {
     check('GET returns defaults', get.json.settings, {
       enabled: true,
       journal: false,
+      freezeIndex: true,
       minReviewTurns: 2,
       minReviewChars: 2000,
       disabledPresets: [],

@@ -120,6 +120,23 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // 索引冻结缓存：sessionId -> 上一次渲染出的索引文本。
+  //
+  // 挂在**根 ctx** 而不是 `ctx.inject` 的子 scope 里 —— cordis 的事件沿作用域
+  // **向上冒泡**，而 `memory-md/settings-changed` 由 routes 在根 ctx 上 emit，
+  // 子 scope 根本收不到（与 `agent/turn-stopping` 那次是同一个坑，见下方 :247）。
+  const frozenIndex = new Map()
+
+  // 设置页保存后清空缓存 —— 这正是 routes.mjs:100 那个
+  // `memory-md/settings-changed` 事件想做的事（此前**只发不收**：
+  // 注释写着"让 Host 半丢弃已缓存的注入文本"，但没有任何监听者）。
+  //
+  // 有了它，「关掉冻结 → 下一轮 → 再打开」才能拿到最新索引；
+  // 否则重新打开时命中的是一份陈旧缓存，用户以为刷新了其实没有。
+  ctx.on('memory-md/settings-changed', () => {
+    frozenIndex.clear()
+  })
+
   // ---- 记忆注入：不变的协议进提示词段，易变的索引进上下文快照
   //
   // 两段分走不同通道，因为生命周期不同：
@@ -170,6 +187,21 @@ export function apply(ctx, config = {}) {
     // **只放索引** —— 它读盘、随记忆增删而变，所以不能进 section（见上）。
     // 纪律是常量，已在上面的 section 里，不在这里重复：曾经拼在这里，
     // 结果是索引一变就把 2400 多字的常量规则带着整段重发（快照是追加而非替换）。
+    //
+    // ## 冻结（`freezeIndex`）
+    //
+    // 打开后不再重复注入：缓存**上一次渲染的文本**，之后恒返回这份缓存。
+    //
+    // 原理：`RuntimeContextProjection.project()` 比对的是
+    // `joinContextSections(sections)` 拼接后的**整串**（dsh-agent-loop/lib/index.js:893），
+    // 相同就不追加（同文件 :339）。返回值恒定 → 整串不变 → 一条新消息都不产生。
+    //
+    // ⚠️ 注意**不能**用"返回空串"来实现冻结：那样整串会因为少了我们这段而变化，
+    // 照样追加一份新快照，而且那份里没有索引 —— 等于把记忆注入弄坏了。
+    //
+    // ⚠️ 官方那几段（沙箱策略 / 审批策略 / 子代理）也在同一个整串里，它们变了
+    // 仍会追加新快照、我们的文本搭车出现。那个由 loop 的全局 supersede 语义决定，
+    // 插件层消不掉；冻结能消掉的是**我们自己这一侧**的重复注入。
     scope.systemPrompt.context({
       name: 'memory-md:index',
       // 外部贡献可用任意有限 order。放在官方三项（沙箱 110 / 审批 115 /
@@ -179,7 +211,35 @@ export function apply(ctx, config = {}) {
         if (!shouldInject(assembly)) return ''
         const agent = assembly?.agent
         const cwd = agent === undefined ? undefined : cwdOf(sessionFor(agent))
-        return renderMemoryIndex({ memoryRoot: paths.memoryRoot, cwd, dshHome: paths.dshHome })
+        const render = () =>
+          renderMemoryIndex({ memoryRoot: paths.memoryRoot, cwd, dshHome: paths.dshHome })
+
+        // 设置**实时读取**：改完立刻生效，不必重启。
+        // 注意这次读盘在缓存命中时**每步仍会发生** —— 与 dsh-preset-md 同一取舍
+        // （其 core.js:443-445 明确记录："缓存命中时每步同步读一次 settings.json"）。
+        // 保留它是为了让「新会话/开关翻转」立刻取到最新设置，不必等插件重启。
+        const freeze = readSettings(paths).freezeIndex === true
+        const id = typeof agent?.id === 'string' ? agent.id : undefined
+
+        // 取不到 sessionId 时**不缓存**，每次读盘。
+        //
+        // dsh-preset-md 在这里用的是"编进 cwd 的兜底键"（其 core.js:415-424），
+        // 理由是它的渲染结果含 `{{cwd}}`，共用一个常量键会串味。我们不同：
+        // 索引文本本身按 cwd 解析出不同作用域（`renderMemoryIndex` 收 cwd 参数），
+        // 不缓存就等于每次按当前 cwd 重新渲染 —— 语义正确且没有串味风险。
+        // 代价只是极少数无 id 场景下多读一次盘，而索引只有一个 MEMORY.md，很便宜。
+        if (!freeze || id === undefined) {
+          if (id !== undefined) frozenIndex.delete(id)
+          return render()
+        }
+
+        // 开着冻结 → 只在缓存缺失时渲染一次，之后恒返回缓存。
+        // 想刷新就把开关关一下再打开（缓存被清），或直接关掉。
+        const cached = frozenIndex.get(id)
+        if (cached !== undefined) return cached
+        const first = render()
+        frozenIndex.set(id, first)
+        return first
       },
     })
   })
@@ -226,8 +286,14 @@ export function apply(ctx, config = {}) {
       logger?.warn?.(`[memory-md] 会话结束总结触发失败: ${String(error)}`)
     }
     // agent 销毁时清掉会话状态，别让 Map 无限增长。
+    //
+    // agent 销毁时清掉会话状态，别让 Map 无限增长。
+    // 索引冻结缓存同理 —— 它在根 ctx 上，这里够得着，一并清掉。
     const id = agent?.id
-    if (typeof id === 'string') forgetSession(id)
+    if (typeof id === 'string') {
+      forgetSession(id)
+      frozenIndex.delete(id)
+    }
   })
 }
 

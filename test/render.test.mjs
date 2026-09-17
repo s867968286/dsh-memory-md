@@ -85,6 +85,8 @@ const STATE = {
   settings: {
     enabled: true,
     journal: true,
+    // 显式给 true：默认值也是 true，这里钉住"开关跟随服务端值"这条契约。
+    freezeIndex: true,
     minReviewTurns: 3,
     minReviewChars: 4000,
     disabledPresets: ['presetmd-*'],
@@ -171,7 +173,7 @@ if (root) {
   const allText = nodes.map(textOf).join('|')
 
   console.log('\n控件都渲染出来了')
-  check('两个开关（启用记忆 / 工作留痕）', switches.length, 2)
+  check('三个开关（启用记忆 / 工作留痕 / 冻结索引）', switches.length, 3)
   check('两个数字输入框（双阈值）', inputs.length, 2)
   check('预设名单 textarea 仍在', textareas.length, 1)
 
@@ -202,8 +204,14 @@ if (root) {
   check('渲染出记忆目录', allText.includes('C:/x/.dsh/memory-md'), true)
 
   console.log('\n开关状态跟随 settings')
-  check('两个开关都是开（enabled/journal 为 true）',
-    switches.every((n) => n.props['aria-checked'] === true), true)
+  {
+    // 开关顺序即渲染顺序：enabled / journal / freezeIndex。
+    const [en, jn, fz] = switches
+    check('启用记忆 开', en?.props['aria-checked'], true)
+    check('工作留痕 开', jn?.props['aria-checked'], true)
+    // 夹具里 freezeIndex 为 true —— 与新的默认值一致。
+    check('冻结索引 开', fz?.props['aria-checked'], true)
+  }
 
   console.log('\n空 settings 也能渲染（不出现 undefined / NaN）')
   {

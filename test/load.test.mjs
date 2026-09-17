@@ -8,7 +8,7 @@
  *
  * 这个测试因此也兼作「装载方式是否正确」的回归：按包名导入能拿到工具。
  */
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -91,6 +91,12 @@ const ctx = {
     listeners.get(name).push(fn)
     return () => {}
   },
+  // 事件总线：`memory-md/settings-changed` 由 routes 在根 ctx 上 emit，
+  // 插件在根 ctx 上监听 —— 测试要能真的触发它（否则清缓存那条路径测不到）。
+  emit(name, payload) {
+    for (const fn of listeners.get(name) ?? []) fn(payload)
+    return true
+  },
   effect(fn) {
     fn()
     return () => {}
@@ -157,6 +163,73 @@ check('context text 是函数（每次装配重读）', typeof contexts[0]?.spec
 console.log('\n订阅轮末后台总结')
 check('订阅了 turn-stopping', listeners.has('agent/turn-stopping'), true)
 check('订阅了 agent/disposed', listeners.has('agent/disposed'), true)
+
+/* ---------- 索引冻结（freezeIndex）----------
+ *
+ * 冻结的判据是「返回值恒定」——`RuntimeContextProjection.project()` 比对的是
+ * 拼接后的整串（dsh-agent-loop/lib/index.js:893），相同就不追加新快照。
+ * 所以这里直接断言 text() 的返回值，不依赖 loop。
+ *
+ * ⚠️ 用 global 作用域：它不需要工作区，`cwd: undefined` 也会读 global 索引。
+ */
+console.log('\n索引冻结：缓存上一次渲染的文本，返回值恒定即不追加')
+{
+  const settingsFile = join(SANDBOX, 'memory-md', 'settings.json')
+  const globalDir = join(SANDBOX, 'memory-md', 'global')
+  const indexPath = join(globalDir, 'MEMORY.md')
+  const writeIndex = (body) => {
+    mkdirSync(globalDir, { recursive: true })
+    writeFileSync(indexPath, body, 'utf8')
+  }
+  const writeSettings = (patch) => {
+    mkdirSync(join(SANDBOX, 'memory-md'), { recursive: true })
+    writeFileSync(settingsFile, JSON.stringify(patch), 'utf8')
+  }
+
+  const spec = contexts[0]?.spec
+  const text = (id) => (typeof spec?.text === 'function'
+    ? spec.text({ agent: id === undefined ? undefined : { id } })
+    : (spec?.text ?? ''))
+
+  writeIndex('# MEMORY.md\n\n- [甲](a.md) — 第一次\n')
+  writeSettings({ enabled: true, freezeIndex: true, journal: false, disabledPresets: [] })
+
+  const first = text('sess-1')
+  check('冻结开启：首次渲染出索引', String(first).includes('第一次'), true)
+
+  // 文件被改了 —— 冻结下返回值**必须**仍是旧的（否则整串一变就又追加一份）
+  writeIndex('# MEMORY.md\n\n- [甲](a.md) — 第一次\n- [乙](b.md) — 第二次\n')
+  const second = text('sess-1')
+  check('冻结开启：索引文件变了也不重新渲染', second, first)
+
+  // 另一个会话有独立的缓存 —— 它拿到的是"当前"索引
+  const other = text('sess-2')
+  check('冻结按会话独立（新会话看到最新）', String(other).includes('第二次'), true)
+
+  // 关掉冻结 → 立刻读盘，拿到最新
+  writeSettings({ enabled: true, freezeIndex: false, journal: false, disabledPresets: [] })
+  const afterOff = text('sess-1')
+  check('关掉冻结：立刻读盘拿到最新', String(afterOff).includes('第二次'), true)
+
+  // 再打开 → 因为关闭期间缓存已被清，拿到的是最新的，而不是一份陈旧文本
+  writeSettings({ enabled: true, freezeIndex: true, journal: false, disabledPresets: [] })
+  const reopened = text('sess-1')
+  check('重新打开：拿到最新（不是陈旧缓存）', String(reopened).includes('第二次'), true)
+
+  // settings-changed 事件清空全部缓存 —— 这是设置页保存后的刷新路径
+  writeIndex('# MEMORY.md\n\n- [丙](c.md) — 第三次\n')
+  ctx.emit('memory-md/settings-changed')
+  const refreshed = text('sess-1')
+  check('settings-changed 清缓存后重新渲染', String(refreshed).includes('第三次'), true)
+
+  // 会话销毁时清掉它的缓存（避免 Map 随会话数增长）
+  writeIndex('# MEMORY.md\n\n- [丁](d.md) — 第四次\n')
+  for (const fn of listeners.get('agent/disposed') ?? []) fn({ agent: { id: 'sess-1' } })
+  const afterDispose = text('sess-1')
+  check('会话销毁后缓存被清（重新渲染）', String(afterDispose).includes('第四次'), true)
+
+  writeSettings({ enabled: true, freezeIndex: false, journal: false, disabledPresets: [] })
+}
 
 // apply() 内部对工具注册失败只 warn 不抛 —— 这里确保没有静默降级。
 console.log('\napply() 期间没有告警')

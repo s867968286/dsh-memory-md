@@ -16,6 +16,20 @@ export const DEFAULT_SETTINGS = {
   /** 是否开启工作留痕（只写不读）。 */
   journal: false,
   /**
+   * 是否**冻结索引快照**。
+   *
+   * 打开（默认）后不再对同一会话重复注入索引：把上一次成功渲染的文本缓存下来，
+   * 之后每次都返回这份缓存 —— 返回值恒定，`RuntimeContextProjection`
+   * 整串比对判定"没变"，就不再往历史里追加新快照。
+   *
+   * 关掉 ＝ 内容一变就注入一份新的。
+   *
+   * ⚠️ 参数**实时读取**：改了设置立刻生效，并**重置缓存**，
+   * 于是关闭时能立刻注入最新索引。这是「想刷新记忆就改参数、
+   * 想稳定了就关掉」这条用法的基础。
+   */
+  freezeIndex: true,
+  /**
    * 触发后台总结的**轮数**门槛：累积够这么多轮就往后台跑一次总结。
    *
    * 与 `minReviewChars` 是**或**关系 —— 任一达标即触发。
@@ -39,7 +53,7 @@ export const DEFAULT_SETTINGS = {
   disabledPresets: [],
 }
 
-const BOOLEAN_KEYS = ['enabled', 'journal']
+const BOOLEAN_KEYS = ['enabled', 'journal', 'freezeIndex']
 const ARRAY_KEYS = ['disabledPresets']
 /**
  * 正整数键：非正数一律回落默认，**不夹到下限**。
