@@ -836,6 +836,197 @@ try {
     check('空输出不产生任何记忆文件', files, ['feedback_不要拿插件文档当需求真源.md'])
   }
 
+  // ⭐ 回归：`file` 字段（2026-09-17 实测确认的真 bug）。
+  //
+  // 原状：SUMMARY_SYSTEM 要求模型"用同一个 file 名覆盖更新"，但**规定的 JSON
+  // 形状里没有 file 字段** —— 模型被要求用一个没在 schema 里出现的东西。
+  //
+  // 两种实测坏结果：
+  //   1. 不传 file → 按 slug 派生 → 不同主题撞名时**静默覆盖**（丢记忆）；
+  //   2. 传 `memory/xxx.md`（照抄主对话索引里的形式）→ 裸 isSafeFile 因含斜杠
+  //      拒绝 → 回落派生 → **同一件事变成两条**。
+  //
+  // 修法：形状里补上 file；消费侧改用 normalizeMemoryFile（与 tools.mjs 同源）；
+  // 派生路径走 resolveMemoryFile 防撞车。三条缺一不可。
+  console.log('\n回归：后台总结的 file 字段（覆盖更新 / 归一化 / 防撞车）')
+  {
+    resetForTest()
+    const globalDir = join(paths.memoryRoot, 'global')
+    const globalMemoryDir = join(globalDir, 'memory')
+    const indexOf = () => readFileSync(join(globalDir, 'MEMORY.md'), 'utf8')
+    const linesOf = () => indexOf().split('\n').filter((l) => l.startsWith('- '))
+    const filesOf = () => (existsSync(globalMemoryDir) ? readdirSync(globalMemoryDir).sort() : [])
+
+    // --- 1) 显式 file（裸文件名）→ 就地更新，不新增文件、不新增索引行
+    const before = linesOf().length
+    const n1 = createTurnStoppingListener({
+      getLlm: () => makeLlm({
+        reply: JSON.stringify({
+          notes: [],
+          memories: [{
+            type: 'feedback',
+            scope: 'global',
+            name: '不要拿插件文档当需求真源',
+            description: '改写后的描述',
+            content: '**Why:** 改写后的正文。\n\n**How to apply:** 照旧。',
+            file: 'feedback_不要拿插件文档当需求真源.md',
+          }],
+        }),
+      }),
+      getSession: () => makeSession(turnEvents(20)),
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    n1({ agent, turn: 20 })
+    await settle()
+    check('裸文件名 → 就地更新（文件数不变）', filesOf().length, 1)
+    check('裸文件名 → 索引行数不变', linesOf().length, before)
+    check('内容确实被更新', readFileSync(
+      join(globalMemoryDir, 'feedback_不要拿插件文档当需求真源.md'), 'utf8',
+    ).includes('改写后的正文'), true)
+
+    // --- 2) 带 `memory/` 前缀（照抄索引的形式）→ 归一化后仍就地更新
+    //
+    // ⚠️ 这条用例必须让**既有文件名无法由 name 派生出来**，否则测不出区别：
+    // 如果 name 派生的文件名恰好就是既有文件，回退路径也会"碰巧"更新同一个文件。
+    // 所以先手工写一个名字与标题不一致的文件，模型再按**文件名**（带前缀）去改它。
+    resetForTest()
+    const { writeMemory } = await import('../src/store.mjs')
+    writeMemory(globalDir, {
+      file: 'feedback_历史条目.md',
+      type: 'feedback',
+      name: '历史结论',
+      description: '旧描述',
+      content: '旧正文。',
+    })
+    const beforeFiles = filesOf().length
+    const beforeLines = linesOf().length
+
+    const n2 = createTurnStoppingListener({
+      getLlm: () => makeLlm({
+        reply: JSON.stringify({
+          notes: [],
+          memories: [{
+            type: 'feedback',
+            scope: 'global',
+            // name 与文件名**不一致** —— 派生不出 feedback_历史条目.md
+            name: '完全不同的标题',
+            description: '又改一次',
+            content: '**Why:** 第二次改写。\n\n**How to apply:** 照旧。',
+            file: 'memory/feedback_历史条目.md',
+          }],
+        }),
+      }),
+      getSession: () => makeSession(turnEvents(21)),
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    n2({ agent, turn: 21 })
+    await settle()
+    check('带前缀 → 归一化后改到既有文件（不新增文件）', filesOf().length, beforeFiles)
+    check('带前缀 → 不新增索引行', linesOf().length, beforeLines)
+    check('既有文件内容被更新', readFileSync(
+      join(globalMemoryDir, 'feedback_历史条目.md'), 'utf8',
+    ).includes('第二次改写'), true)
+
+    // --- 3) 不同主题但派生同名 → 防撞车（不覆盖）
+    resetForTest()
+    const n3 = createTurnStoppingListener({
+      getLlm: () => makeLlm({
+        reply: JSON.stringify({
+          notes: [],
+          memories: [{
+            type: 'reference',
+            scope: 'global',
+            name: '端口分配',
+            description: '本地端口',
+            content: '正文一。',
+          }],
+        }),
+      }),
+      getSession: () => makeSession(turnEvents(22)),
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    n3({ agent, turn: 22 })
+    await settle()
+    const countAfterFirst = filesOf().length
+
+    resetForTest()
+    const n4 = createTurnStoppingListener({
+      getLlm: () => makeLlm({
+        reply: JSON.stringify({
+          notes: [],
+          memories: [{
+            type: 'reference',
+            scope: 'global',
+            name: '端口分配！', // 只差一个标点 → slug 相同
+            description: '另一个主题',
+            content: '正文二。',
+          }],
+        }),
+      }),
+      getSession: () => makeSession(turnEvents(23)),
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    n4({ agent, turn: 23 })
+    await settle()
+    check('slug 撞车 → 另起文件而不是覆盖', filesOf().length, countAfterFirst + 1)
+    // 两条正文都要还在 —— 这才是防撞车的意义
+    const allText = filesOf().map((f) => readFileSync(join(globalMemoryDir, f), 'utf8')).join('\n')
+    check('第一条正文没被覆盖', allText.includes('正文一。'), true)
+    check('第二条也写进去了', allText.includes('正文二。'), true)
+  }
+
+  // ⭐ 回归：后台总结必须用**与工具同源**的记忆根目录（2026-09-17 实测确认）。
+  //
+  // 原状：`run()` 里调的是无参 `resolvePaths()`，而 tools.mjs / routes.mjs / index.js
+  // 三处都传 `config.dshHome`。profile 显式传一个与 DSH_HOME 环境变量不同的目录时，
+  // 工具写到 A、后台总结写到 B —— 表现为"手动存得进、后台总结看不见"。
+  console.log('\n回归：后台总结用注入的 dshHome（与工具同源）')
+  {
+    resetForTest()
+    // 与 process.env.DSH_HOME（= SANDBOX）**不同**的目录
+    const OTHER_HOME = join(SANDBOX, 'other-home')
+    rmSync(OTHER_HOME, { recursive: true, force: true })
+    mkdirSync(OTHER_HOME, { recursive: true })
+
+    const n = createTurnStoppingListener({
+      getLlm: () => makeLlm({
+        reply: JSON.stringify({
+          notes: ['写进 other-home 的一条'],
+          memories: [{
+            type: 'reference',
+            scope: 'global',
+            name: '异构根目录测试',
+            description: '验证 dshHome 传递',
+            content: '正文。',
+          }],
+        }),
+      }),
+      getSession: () => makeSession(turnEvents(30)),
+      isDisabledFor: () => false,
+      dshHome: OTHER_HOME,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    n({ agent, turn: 30 })
+    await settle()
+
+    // 记忆必须落在注入的 dshHome 下，而不是环境变量指向的那个。
+    const inOther = join(OTHER_HOME, 'memory-md', 'global', 'memory')
+    check('记忆写进注入的 dshHome', existsSync(inOther), true)
+    const files = existsSync(inOther) ? readdirSync(inOther) : []
+    check('确实写了一条记忆', files.some((f) => f.includes('异构根目录测试')), true)
+
+    // 反向：不该在环境变量那个根目录里也产生同名文件（那正是修复前的行为）。
+    const inEnv = join(SANDBOX, 'memory-md', 'global', 'memory')
+    const envFiles = existsSync(inEnv) ? readdirSync(inEnv) : []
+    check('没有写到环境变量那个根目录', envFiles.some((f) => f.includes('异构根目录测试')), false)
+
+    rmSync(OTHER_HOME, { recursive: true, force: true })
+  }
+
   console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`)
 } finally {
   rmSync(SANDBOX, { recursive: true, force: true })

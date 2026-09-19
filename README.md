@@ -51,7 +51,10 @@ ctx.systemPrompt.context({
 **为什么不能只放工具 description**：这是**事前纪律**，不是工具用法。模型得在**决定要不要写**的时刻就知道「先查再写」，等它已经调 `memory_md_save` 时才看到就晚了。工具 description 只适合放「这个工具怎么调」。
 
 
-**没有索引时不注入纪律** —— 一条记忆都没有时讲一堆纪律只是噪音。
+**没有索引时快照为空，但纪律照常在。** 纪律是**常量**、走 `section()`，它不可能
+依赖"磁盘上有没有索引"——所以一条记忆都没有时，提示词段里仍有纪律，只是
+`context()` 那份快照返回空串（不注入任何东西）。这是刻意的：纪律讲的正是
+"什么时候**该去写**记忆"，恰恰在空库时最需要它。
 
 **后台总结也要防重复。** 后台总结是**独立 LLM 调用**，它看不到注入快照（快照进的是主对话）。所以：
 
@@ -427,7 +430,7 @@ type: reference
 
 | 入口 | 行为 |
 |---|---|
-| 四个 `memory_md_*` 工具 | 直接拒绝并说明原因 |
+| 五个 `memory_md_*` 工具 | 直接拒绝并说明原因 |
 | 后台总结 | 不跑（不写记忆、不写日志） |
 | 记忆注入 | 不注入协议段与索引快照 |
 
@@ -478,7 +481,7 @@ node test/run.mjs    # 跑全部 15 个测试套件
 | 文件 | 作用 |
 |---|---|
 | `src/index.js` | Host 半：注册工具 + 两段式注入 + HTTP 接口 |
-| `src/tools.mjs` | 四个记忆工具的实现与说明书 |
+| `src/tools.mjs` | 五个记忆工具的实现与说明书 |
 | `src/inject.mjs` | 注入：`MEMORY_PROTOCOL`（提示词段）+ `renderMemoryIndex`（快照） |
 | `src/summarize.mjs` | 轮末后台总结：独立 LLM 调用，写记忆与日志 |
 | `src/schema.mjs` | schema 转换（不用 `defineTool`，见下） |
@@ -488,6 +491,30 @@ node test/run.mjs    # 跑全部 15 个测试套件
 | `src/context.mjs` | 路径解析 |
 | `src/codebuddy-port.mjs` | 截断与 frontmatter（CodeBuddy 移植） |
 | `client/client.js` | 设置页（`settings.section`） |
+
+### ⚠️ 为什么顶层不声明 `inject: ['webServer']`
+
+cordis 的 `inject` 是**必要依赖**：依赖未就绪时 fiber 停在 INACTIVE，**`apply()`
+根本不会执行**（实测：缺 webServer 时 `apply()` 不跑，没有 inject 声明的照常跑）。
+
+而 `webServer` 只由 **dsh-web-app** bundle 提供（其 `cordis.patch.yml:136` 插入
+`dsh-host-webserver`）——`dsh-base`、`dsh-headless`、`dsh-acp-app` **都不含**它。
+
+所以把 `webServer` 写进顶层 `inject` 的后果是：在 headless / acp profile 下，
+插件**整体静默失效** —— 不只是设置页没有，而是**五个记忆工具与两段式注入
+全部不注册**，且不打任何警告，排查时完全看不出原因。
+
+因此本插件**分层**：
+
+| 能力 | 依赖 | 缺 webServer 时 |
+|---|---|---|
+| 五个记忆工具 | `ctx.get('tools')` | ✅ 照常注册（取不到只 warn） |
+| 两段式注入 | `ctx.inject(['systemPrompt'])` | ✅ 照常生效 |
+| 后台总结 | `ctx.inject(['llm'])` | ✅ 照常运行 |
+| 设置页路由 | `ctx.inject(['webServer'])` | ⛔ 只有它不注册 |
+
+`load` 套件有一条**防回归**断言：`mod.inject` 必须为空数组 —— 谁再把
+`webServer` 提升成整个插件的准入门槛，测试立刻变红。
 
 ### ⚠️ 为什么不用 `defineTool`
 

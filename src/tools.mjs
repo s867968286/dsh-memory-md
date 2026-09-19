@@ -28,8 +28,9 @@ import {
   listMemoryFiles,
   memoryFilePath,
   normalizeMemoryFile,
+  oneLine,
   readText,
-  slugify,
+  resolveMemoryFile,
   timeStamp,
   writeAtomic,
   writeMemory,
@@ -240,7 +241,9 @@ export function registerMemoryTools({ tools, config, logger }) {
           `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,
         )
       }
-      const file = requested ?? `${type}_${slugify(args.name)}.md`
+      // 文件名：显式传了就用它（有意覆盖）；否则派生，**并且避开 slug 撞车**
+      // ——见 `resolveMemoryFile()` 的说明：不同标题派生同名会把上一条整条覆盖掉。
+      const file = resolveMemoryFile(dir, { requested, type, name: args.name })
 
       const { created } = writeMemory(dir, {
         file,
@@ -252,12 +255,16 @@ export function registerMemoryTools({ tools, config, logger }) {
 
       logger?.info?.(`[memory-md] ${created ? '已创建' : '已更新'} ${memoryFilePath(dir, file)}`)
 
+      // 返回值里的 indexLine 要和**实际写进索引的那一行**一致。
+      // `writeMemory()` 会把 name/description 里的空白折叠成单空格（防换行污染
+      // frontmatter 与索引），所以这里不能回显原始入参 —— 否则回报给模型的是
+      // 一行并不存在于索引里的文本。
       return Promise.resolve({
         file,
         path: memoryFilePath(dir, file),
         scope: args.scope,
         created,
-        indexLine: `- [${args.name}](memory/${file}) \u2014 ${args.description}`,
+        indexLine: `- [${oneLine(args.name)}](memory/${file}) \u2014 ${oneLine(args.description)}`,
       })
     },
     presentCall: (args) => ({

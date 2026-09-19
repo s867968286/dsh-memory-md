@@ -229,7 +229,12 @@ ctx.inject(['systemPrompt'], (scope) => {
 - 索引文件变化 → 下次装配即生效，**不重启**
 - 索引文件未变 → loop 的 `RuntimeContextProjection` 比对后**不产生消息**，天然满足
   「变了才注入、没变不重复注入」，**不需要自己做跳过机制**
-- 骨架 `inject` 仍为 `['webServer']`，另经 `ctx.inject(['systemPrompt'])` 延迟注册
+- 骨架 `inject` 为**空数组**（`inject = []`），另经 `ctx.inject(['systemPrompt'])`
+  延迟注册。**刻意不把 `webServer` 写进顶层** —— 那是必要依赖，而 `webServer`
+  只由 dsh-web-app bundle 提供，写进顶层会让插件在 headless / acp profile 下
+  **连 `apply()` 都不执行**（工具与注入一起消失）。设置页路由改走
+  `ctx.inject(['webServer'], …)`，缺服务时只有它不注册。见 README 的
+  「为什么顶层不声明 `inject: ['webServer']`」。
 
 > 依据：`@deepseek-ai/dsh-system-prompt` 的 `section()` / `context()` API 与
 > `dsh-sandbox-policy` 的参考实现（注册 `sandbox:policy`）；
@@ -677,8 +682,9 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
 
 ### 骨架与基础（已完成）
 
-- [x] 确定插件骨架（Cordis plugin）—— 实际用 `inject = ['webServer']` +
-      `ctx.inject(['systemPrompt'])` 延迟注册（host 平面早期该服务可能未就绪）
+- [x] 确定插件骨架（Cordis plugin）—— 顶层 `inject = []`（后改为空，见 README 的
+      webServer 分层说明），其余服务经 `ctx.inject([...])` 延迟注册
+      （host 平面早期这些服务可能未就绪）
 - [x] 实现 slug 计算 —— `src/context.mjs` 的 `getCompressedWorkDir()`（沿用 CodeBuddy 规则）
 - [x] 实现路径解析（global / 项目级）—— `src/context.mjs` 的 `resolveScopes()`
 - [x] 实现索引读取 + 行数限制 —— `src/inject.mjs` 的 `readIndex()`，200 行 / 4e4 字符
@@ -687,7 +693,7 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
 
 ### 本轮新增（2026-09-13 定案 → 已实施）
 
-- [x] **注入改走 `systemPrompt.context()`**（六节）—— `src/inject.mjs`；骨架 `inject` 仍为 `['webServer']`，
+- [x] **注入改走 `systemPrompt.context()`**（六节）—— `src/inject.mjs`；骨架 `inject` 改为**空数组**，
       另经 `ctx.inject(['systemPrompt'])` 延迟注册（host 平面早期该服务可能未就绪）
 - [x] **轮末提醒改后台异步 LLM**（7.1）—— `src/summarize.mjs`；`remind.mjs` 已删除
 - [x] **后台总结写入记忆文件与日志文件**（7.1 / 7.3）—— 复用 `src/store.mjs` 的同一套写入原语

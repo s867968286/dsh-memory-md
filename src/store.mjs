@@ -140,11 +140,20 @@ export function timeStamp(now = new Date()) {
  *
  * 这样「同一天里分几次写的」一眼可见，不必靠猜条目顺序。
  *
+ * ## 条目必须一行一条
+ *
+ * 日志的条目结构就是「`- ` 开头的行」。一条 note 里若含换行，后半截会变成
+ * **另一条独立条目**（实测：一条含换行的 note 会被 `countEntries()` 数成 2 条，
+ * 于是 `memory_md_journal` 回报的 `total` 虚高，人读起来也多出一条没写过的记录）。
+ *
+ * 所以这里折叠空白 —— 与 `writeMemory()` 对 frontmatter 的处理同一个理由、
+ * 同一套做法：契约本来就是"每条 1-3 句"，折叠不改变语义，却让结构无法被内容破坏。
+ *
  * 纯函数：读取→拼接必须一次性做完再原子替换，中间不能 await。
  */
 export function appendJournalEntries(existing, date, notes, stamp) {
   const header = existing === undefined ? `# ${date}\n` : existing.replace(/\s*$/, '\n')
-  const block = [`## ${stamp}`, ...notes.map((n) => `- ${n}`)].join('\n')
+  const block = [`## ${stamp}`, ...notes.map((n) => `- ${oneLine(n)}`)].join('\n')
   return `${header}\n${block}\n`
 }
 
@@ -266,21 +275,62 @@ export function formatMemoryManifest(manifest) {
 }
 
 /**
+ * 判断一行索引条目是否指向某个文件。
+ *
+ * ## 为什么不能只用 `line.includes(`](${file})`)`
+ *
+ * 那是**整行子串**匹配，会被**描述里的文字**骗到。实测过的真事故：
+ *
+ *   1. 先写乙：`- [乙](memory/b.md) — 第二条`
+ *   2. 再写甲，描述恰好引用了乙 → `- [甲](memory/a.md) — 见 ](memory/b.md)`
+ *
+ * `upsertIndexLine('memory/b.md', …)` 的 `findIndex` 会**先命中甲那一行**
+ * （因为甲的描述里含 `](memory/b.md)`），于是把甲的行**原地替换**，
+ * 乙真正的索引行反而被覆盖掉 —— 乙的正文还在，索引里却没它了。
+ * `removeIndexLine` 同理：删甲会连带删掉描述里提到甲的乙。
+ *
+ * 引用另一条记忆的链接在**协议里是被鼓励的**（"细节写进条目文件"），
+ * 所以这不是臆想出来的输入，是自然会写出来的描述。
+ *
+ * ## 精确判据
+ *
+ * 条目行由**我们自己**生成，形状固定：`- [标题](链接) — 描述`。
+ * 所以只认**紧跟标题闭合括号的那一段链接** —— 也就是从行首到 `](file)`
+ * 的第一次出现处，且其前必须是 `[` 起的标题（即行首是 `- [`）。
+ * 用非贪婪匹配锁住第一个 `](...)`，描述里的任何链接都不会被看到。
+ */
+function indexLineTargets(line, file) {
+  // 只匹配行首的 `- [标题](链接)`，不扫描述部分。
+  const m = /^- \[[^\]]*\]\(([^)]*)\)/.exec(line)
+  return m !== null && m[1] === file
+}
+
+/**
  * 把一行追加到索引（不存在则创建并加标题）。
  *
  * `file` 是**相对作用域的链接路径**（如 `memory/user_x.md`）—— 索引在作用域根，
  * 正文在 `memory/`，所以链接必须带上子目录，否则点开找不到文件。
+ *
+ * ## 这里自己做一行化，不假设调用方已经做过
+ *
+ * 索引是**整份注入上下文**的东西，一行条目一旦断裂成两行，就凭空多出一条
+ * 索引项（等于内容能往索引里插任意行）。`writeMemory()` 已经把 name/description
+ * 折叠过了，但**这个函数是索引行的唯一收口**——将来多一个调用方、它忘了折叠，
+ * 索引就又破了。所以防御放在收口处，而不是指望每个调用方都记得。
+ *
+ * 折叠是安全的：`title` / `description` 的契约本来就是一行。
  */
 export function upsertIndexLine(indexPath, file, title, description) {
-  const line = `- [${title}](${file}) \u2014 ${description}`
+  const line = `- [${oneLine(title)}](${file}) \u2014 ${oneLine(description)}`
   const existing = readText(indexPath)
   if (existing === undefined) {
     writeAtomic(indexPath, `# ${MEMORY_ENTRYPOINT}\n\n${line}\n`)
     return
   }
-  // 已存在同文件的条目 → 原地替换，避免重复
+  // 已存在同文件的条目 → 原地替换，避免重复。
+  // 判据必须精确到「行首链接」，否则描述里的链接会让我们改错行（见 indexLineTargets）。
   const lines = existing.split('\n')
-  const idx = lines.findIndex((l) => l.includes(`](${file})`))
+  const idx = lines.findIndex((l) => indexLineTargets(l, file))
   if (idx >= 0) {
     lines[idx] = line
     writeAtomic(indexPath, lines.join('\n'))
@@ -293,9 +343,12 @@ export function upsertIndexLine(indexPath, file, title, description) {
 /**
  * 从索引里删掉指向某个文件的条目行。
  *
- * 与 `upsertIndexLine()` 对称：那边按 `](file)` 匹配做原地替换，这里按同一
+ * 与 `upsertIndexLine()` 对称：那边按行首链接匹配做原地替换，这里按同一
  * 判据整行移除。**只删索引行，不动其他行** —— 标题、空行、以及别的条目
  * 原样保留，人工加在索引里的说明文字不会被误伤。
+ *
+ * 判据同样是**行首链接**而非整行子串：描述里引用别的记忆很常见，
+ * 用子串匹配会连带删掉那些行（见 `indexLineTargets` 的说明）。
  *
  * @returns 是否真的删掉了一行（false = 索引里本来就没有这条）。
  */
@@ -303,7 +356,7 @@ export function removeIndexLine(indexPath, file) {
   const existing = readText(indexPath)
   if (existing === undefined) return false
   const lines = existing.split('\n')
-  const kept = lines.filter((l) => !l.includes(`](${file})`))
+  const kept = lines.filter((l) => !indexLineTargets(l, file))
   if (kept.length === lines.length) return false
   writeAtomic(indexPath, kept.join('\n'))
   return true
@@ -339,6 +392,79 @@ export function deleteMemory(dir, file) {
 }
 
 /**
+ * frontmatter 值的一行化。
+ *
+ * ## 为什么必须做
+ *
+ * `name` / `description` 是**裸插值**进 frontmatter 的，而它们是模型给的自由文本。
+ * 含换行时后果不止"文件格式不好看"：
+ *
+ *   description: 第一行\n- [伪造条目](memory/evil.md) — 我插进来的
+ *
+ * 会让**索引凭空多出一行**（实测确认）—— 等于一条记忆能往索引里写任意多行，
+ * 而索引是整份注入上下文的东西，"索引行由插件维护"这条保证就此失效。
+ * 含 `\n---\n` 更严重：frontmatter 提前闭合，`type` 等字段直接丢失。
+ *
+ * ## 为什么是「折叠空白」而不是「报错」
+ *
+ * 这两个字段的契约本来就是**一行**（工具描述写明"一行、约 150 字以内"），
+ * 所以把任意空白串折成单个空格**不改变语义**，却让"写出坏文件"成为不可能 ——
+ * 比拒绝写入更稳：后台总结路径上的报错只会变成一条日志，而记忆已经丢了。
+ *
+ * `---` 作为整行是危险的，但折叠后 `description: ---` 仍是一行，
+ * 解析器按**行首** `---` 判定终止符，它不会被误认。
+ *
+ * 导出是刻意的：`tools.mjs` 回报的 `indexLine` 必须与**实际写进索引的那一行**
+ * 逐字一致，所以它要调用同一个函数，而不是自己再折一遍。
+ */
+export function oneLine(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * 决定一条记忆该写进哪个文件名。
+ *
+ * ## 三种情形
+ *
+ * 1. **显式传了 `file`** → 那是有意覆盖（"传同一个 file 覆盖更新"），照用。
+ * 2. **派生出的文件名还不存在** → 用它。
+ * 3. **派生出的文件名已存在** → 再看 frontmatter 里的 `name`：
+ *    - `name` 相同 = 同一条记忆被重复保存 → **就地更新**（这是既有契约：
+ *      "同一文件重复保存 = 就地更新，索引条目不会重复"）；
+ *    - `name` 不同 = **slug 撞车**，两条不同主题的记忆挤到了同一个文件名上。
+ *
+ * 第 3 种的后半是实测确认的真事故：`slugify()` 会把所有非
+ * `[a-z0-9\u4e00-\u9fa5]` 字符替换成 `_`，于是「重试机制」与「重试机制！」派生出
+ * **同一个** `feedback_重试机制.md`，后写的把先写的**整条覆盖掉**，索引里也只留后一条 ——
+ * 前一条无声消失。长标题更危险：`slugify` 截断到 40 字符，前 40 字相同的标题必然撞车。
+ *
+ * 所以这里加了序号后缀另起一个文件。**宁可多一条可见的重复，也不要少一条不可见的记忆** ——
+ * 重复可以在索引里被人一眼看见并手工合并，丢失看不见。
+ *
+ * @param requested - 调用方显式指定的文件名（已过 `normalizeMemoryFile`）；无则派生。
+ * @returns 纯文件名（不含目录）。
+ */
+export function resolveMemoryFile(dir, { requested, type, name }) {
+  if (requested !== undefined) return requested
+
+  const slug = slugify(name)
+  const derived = `${type}_${slug}.md`
+  const existing = readText(join(dir, MEMORY_DIR, derived))
+  if (existing === undefined) return derived
+
+  // 文件已存在。同名 → 更新；异名 → 撞车，另起一个。
+  const { data } = parseMemoryFrontmatter(existing)
+  if (String(data.name ?? '') === String(name ?? '')) return derived
+
+  for (let n = 2; n < 100; n++) {
+    const candidate = `${type}_${slug}-${n}.md`
+    if (readText(join(dir, MEMORY_DIR, candidate)) === undefined) return candidate
+  }
+  // 100 个同 slug 文件还没排开 —— 极不可能，退回覆盖（至少不丢新内容）。
+  return derived
+}
+
+/**
  * 写一条记忆：正文 + frontmatter，并同步索引。
  *
  * 正文写进 `<dir>/memory/<file>`，索引行链接写成 `memory/<file>`。
@@ -348,10 +474,13 @@ export function writeMemory(dir, { file, type, name, description, content }) {
   const path = join(dir, MEMORY_DIR, file)
   const created = readText(path) === undefined
   const body = String(content ?? '').trim()
-  const frontmatter = ['---', `name: ${name}`, `description: ${description}`, `type: ${type}`, '---', '']
+  // ⚠️ 必须一行化：裸插值的换行会污染 frontmatter，进而能往索引里插任意行。
+  const safeName = oneLine(name)
+  const safeDescription = oneLine(description)
+  const frontmatter = ['---', `name: ${safeName}`, `description: ${safeDescription}`, `type: ${type}`, '---', '']
   writeAtomic(path, `${frontmatter.join('\n')}\n${body}\n`)
   // 索引链接带 `memory/` 前缀 —— 索引在根、正文在子目录。
-  upsertIndexLine(join(dir, MEMORY_ENTRYPOINT), `${MEMORY_DIR}/${file}`, name, description)
+  upsertIndexLine(join(dir, MEMORY_ENTRYPOINT), `${MEMORY_DIR}/${file}`, safeName, safeDescription)
   return { path, created }
 }
 

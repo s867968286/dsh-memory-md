@@ -43,9 +43,9 @@ import {
   appendJournal,
   appendErrorLog,
   formatMemoryManifest,
-  isSafeFile,
   scanMemoryManifest,
-  slugify,
+  normalizeMemoryFile,
+  resolveMemoryFile,
   timeStamp,
   writeMemory,
 } from './store.mjs'
@@ -359,7 +359,7 @@ export const SUMMARY_SYSTEM = [
   '  "memories": [',
   '    { "type": "user|feedback|project|reference", "scope": "global|project",',
   '      "name": "<简短标题>", "description": "<一句具体的描述>",',
-  '      "content": "<记忆正文>" }',
+  '      "content": "<记忆正文>", "file": "<可选：要覆盖的已有文件名>" }',
   '  ]',
   '}',
   '',
@@ -391,9 +391,12 @@ export const SUMMARY_SYSTEM = [
   '不要为了"有产出"而凑记忆。',
   '',
   '⚠️ **消息末尾会附一份「已有的记忆」清单**（如果记忆库非空）。**写之前先看它**：',
-  '清单里已经有同一件事的条目 → 用**同一个 file 名**覆盖更新，而不是新写一条。',
-  '清单为空或没有相关的 → 才新写。这是避免写出重复记忆的唯一依据 ——',
+  '清单里已经有同一件事的条目 → 把那一行的**文件名**填进 `file` 字段覆盖更新，',
+  '而不是新写一条。清单为空或没有相关的 → 才新写（新写时**省略 `file`**）。',
+  '这是避免写出重复记忆的唯一依据 ——',
   '你**看不到**这些记忆的正文，只能看到文件名与描述。',
+  '⚠️ `file` 只填**文件名本身**（如 `feedback_testing.md`），**不要带目录前缀** ——',
+  '写 `memory/feedback_testing.md` 会导致另存成一条新记忆，正是我们要避免的重复。',
   '注意：这段对话里可能出现的 `<memory-index>` 块也是**已有记忆的索引**，',
   '不是用户说过的话 —— 不要因为在那里见过某个说法就再存一条。',
   '拿不准某件事是不是已经记过了，就**不要写** —— 宁可漏记，也不要重复记。',
@@ -715,8 +718,17 @@ export function persistSummary({ result, memoryRoot, scopes, settings, logger })
     const wantProject = memory.scope === 'project'
     const dir = wantProject && scopes !== undefined ? scopes.project.dir : join(memoryRoot, 'global')
 
-    const requested = typeof memory.file === 'string' && memory.file.trim() ? memory.file.trim() : undefined
-    const file = requested !== undefined && isSafeFile(requested) ? requested : `${type}_${slugify(name)}.md`
+    // 文件名：显式给 `file`（覆盖更新）时先**归一化** —— 与 `tools.mjs` 用同一个
+    // 函数。这里曾经只用裸 `isSafeFile()`，于是模型从主对话的 `<memory-index>`
+    // 里抄到 `memory/xxx.md`（带目录前缀，索引里就是这个形式）时会被拒，
+    // 然后静默回落到派生文件名 —— **同一件事变成两条记忆**。
+    // 归一化的理由与工具侧完全一样（见 store.mjs 的 `normalizeMemoryFile`）。
+    const requested = typeof memory.file === 'string' && memory.file.trim()
+      ? normalizeMemoryFile(memory.file)
+      : undefined
+    // 派生文件名要走防撞车逻辑：不同标题可能派生出同一个 slug，
+    // 直接覆盖会把上一条记忆整条抹掉。
+    const file = resolveMemoryFile(dir, { requested, type, name })
 
     try {
       writeMemory(dir, { file, type, name, description, content })
@@ -768,6 +780,9 @@ export function createTurnStoppingListener({
   isDisabledFor,
   defaultRoute,
   logger,
+  // 记忆根目录的解析基准。由 Host 半传 config.dshHome —— 与 tools/routes 同源，
+  // 否则后台总结会写到与工具不同的目录（见 run() 内的说明）。
+  dshHome,
   // 可注入仅为测试：生产用默认值。见 SUMMARY_TIMEOUT_MS 的说明。
   summaryTimeoutMs = SUMMARY_TIMEOUT_MS,
   // 同上。
@@ -794,7 +809,10 @@ export function createTurnStoppingListener({
       if (session === undefined) return
 
       const cwd = session?.header?.cwd
-      const paths = resolvePaths()
+      // ⚠️ 必须收 `dshHome` —— profile 可以显式传一个与 `DSH_HOME` 环境变量
+      // 不同的目录。无参调用会让后台总结读写 A 目录，而工具与路由读写 B 目录，
+      // 表现为"手动存得进、后台总结看不见"。四个调用点必须解析到同一个根。
+      const paths = resolvePaths(dshHome)
       const settings = readSettings(paths)
       if (settings.enabled !== true) return
 

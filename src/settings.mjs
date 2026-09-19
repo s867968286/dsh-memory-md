@@ -3,11 +3,14 @@
  *
  * 缺失或损坏时全部回落默认值 —— 与 `dsh-preset-md` 同一套约定。
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { dshHomeDir } from './context.mjs'
 import { joinPath } from './codebuddy-port.mjs'
+// 原子写复用 store 的实现：临时名带随机后缀，避免并发写共用临时文件。
+// 唯一依赖方向是 settings → store，store 不 import settings，无环。
+import { writeAtomic } from './store.mjs'
 
 /** 默认设置。 */
 export const DEFAULT_SETTINGS = {
@@ -137,9 +140,10 @@ export function writeSettings(paths, patch) {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (patch && patch[key] !== undefined) next[key] = normalizeSetting(key, patch[key])
   }
-  mkdirSync(dirname(paths.settingsFile), { recursive: true })
-  const tmp = `${paths.settingsFile}.${process.pid}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
-  renameSync(tmp, paths.settingsFile)
+  // 复用 `writeAtomic()` 而不是自己拼临时名：那边带随机后缀，这边曾经是
+  // `${settingsFile}.${pid}.tmp`。同进程内两次并发写会**共用同一个临时文件**，
+  // 后写的覆盖先写的、两次 rename 搬走同一份内容 —— 一次更新静默消失。
+  // 这正是 store.mjs 里记过的那个事故，当时修了 store 却漏了这里。
+  writeAtomic(paths.settingsFile, `${JSON.stringify(next, null, 2)}\n`)
   return next
 }

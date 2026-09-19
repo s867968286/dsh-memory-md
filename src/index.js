@@ -49,7 +49,25 @@ const presetOf = (session) => {
 }
 
 export const name = 'memory-md-host'
-export const inject = ['webServer']
+/**
+ * ⚠️ **不要**把 `webServer` 写进这里。
+ *
+ * cordis 的 `inject` 是**必要依赖**：依赖未就绪时 fiber 停在 INACTIVE，
+ * `apply()` **根本不会执行**（实测：缺 webServer 时 `apply()` 不跑，无 inject
+ * 声明的照常跑）。而 `webServer` 只由 `dsh-web-app` bundle 提供
+ * （其 cordis.patch.yml:136 插入 `dsh-host-webserver`），`dsh-base` 与
+ * `dsh-headless` / `dsh-acp-app` 都**不含**它。
+ *
+ * 所以顶层声明 `inject: ['webServer']` 的后果是：在 headless / acp profile 下
+ * 插件**整体静默失效** —— 不只是设置页没有，而是五个记忆工具与两段式注入
+ * 全部不注册、且不打任何警告，排查时完全看不出原因。
+ *
+ * 正确做法是分层：工具与注入**都不依赖 webServer**，各自走
+ * `ctx.inject(['tools'], …)` / `ctx.inject(['systemPrompt'], …)` 延迟注册；
+ * **只有设置页路由**才 Web 专属 —— 它在 `ctx.inject(['webServer'], …)` 里注册，
+ * 缺服务时那条回调不执行，其余能力照常工作。
+ */
+export const inject = []
 export function apply(ctx, config = {}) {
   const paths = resolvePaths(config.dshHome)
   const logger = ctx.logger
@@ -94,16 +112,35 @@ export function apply(ctx, config = {}) {
   // 设置页需要读写记忆目录，挂在 host 平面（bundle 行插件无法注册 web 路由）。
   // 不再传工作区回调：设置页是全局页面，拿不到「当前会话」，猜出来的路径
   // 切换会话后就是错的（详见 routes.mjs 的说明）。
-  registerRoutes(ctx, config)
+  //
+  // 用 `ctx.inject(['webServer'], …)` 延迟注册，**而不是**顶层
+  // `export const inject = ['webServer']`：后者会让整个插件在没有 webServer 的
+  // profile（headless / acp）下连 apply() 都不执行，工具与注入一起消失
+  // ——见文件顶部 inject 的说明。这里缺服务只是少一个设置页。
+  ctx.inject(['webServer'], (scope) => {
+    try {
+      registerRoutes(scope, config)
+    } catch (error) {
+      // 设置页失败不该拖垮工具与注入。
+      logger?.warn?.(`[memory-md] 设置页路由注册失败: ${String(error)}`)
+    }
+  })
 
   // ---- 记忆工具：本插件对外提供的唯一能力面
-  const tools = ctx.get('tools')
-  if (tools === undefined) {
-    logger?.warn?.('[memory-md] tools 服务不可用，记忆工具未注册')
-  } else {
+  //
+  // 用 `ctx.inject(['tools'], …)` 延迟注册，**不是** `ctx.get('tools')` 直接取。
+  //
+  // 为什么：顶层 `inject` 现在是空数组，`apply()` 会在**任何依赖就绪之前**就跑。
+  // 此时若 `tools` 还没装载，`ctx.get('tools')` 拿到 undefined，工具就**永久**
+  // 注册不上 —— 而装载顺序取决于 profile 的 bundles 列表，把正确性押在
+  // "我们的行排在 tools 之后"是脆弱的（实测确认：tools 晚就绪 → 5 个工具全丢）。
+  //
+  // `ctx.inject` 是 cordis 的延迟注入：依赖**出现时**才回调，服务后来才就绪也能补上。
+  // 与 `systemPrompt` / `llm` 用的是同一条通道，语义一致。
+  ctx.inject(['tools'], (scope) => {
     try {
       const dispose = registerMemoryTools({
-        tools,
+        tools: scope.tools,
         config: {
           dshHome: paths.dshHome,
           workspaceCwd,
@@ -113,12 +150,12 @@ export function apply(ctx, config = {}) {
         },
         logger,
       })
-      ctx.effect(() => dispose)
+      scope.effect(() => dispose)
     } catch (error) {
-      // 工具注册失败不该拖垮设置页 —— 两个能力互相独立。
+      // 工具注册失败不该拖垮设置页与注入 —— 三个能力互相独立。
       logger?.warn?.(`[memory-md] 记忆工具注册失败: ${String(error)}`)
     }
-  }
+  })
 
   // 索引冻结缓存：sessionId -> 上一次渲染出的索引文本。
   //
@@ -266,6 +303,8 @@ export function apply(ctx, config = {}) {
     isDisabledFor,
     // 兜底路由：会话还没有 requestHeader 时用部署默认模型。
     defaultRoute: () => defaultRouteOf(ctx),
+    // 与 tools/routes 同一个基准 —— 否则后台总结会写到另一个记忆根目录。
+    dshHome: paths.dshHome,
     logger,
   })
   ctx.on('agent/turn-stopping', listener)

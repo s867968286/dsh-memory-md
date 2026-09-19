@@ -40,7 +40,16 @@ console.log('\n按包名装载')
 const mod = await import('dsh-memory-md')
 
 check('package entry exports apply', typeof mod.apply, 'function')
-check('declares webServer inject', mod.inject, ['webServer'])
+// ★ 顶层**不得**声明 webServer 依赖。
+//
+// cordis 的 `inject` 是必要依赖：依赖缺失时 apply() 根本不执行（实测）。
+// 而 webServer 只由 dsh-web-app bundle 提供，dsh-base / dsh-headless / dsh-acp-app
+// 都不含它 —— 一旦写进顶层，插件在 headless/acp 下会**整体静默失效**：
+// 五个记忆工具与两段式注入全部不注册，且不打任何警告。
+//
+// 所以这条断言是**防回归**：设置页必须走下面的 ctx.inject(['webServer']) 延迟注册，
+// 而不是把 webServer 提升成整个插件的准入门槛。
+check('顶层不依赖 webServer（否则 headless 下整体失效）', mod.inject, [])
 check('route prefix', mod.ROUTE_PREFIX, '/memory-md')
 void LINK
 
@@ -67,10 +76,19 @@ const ctx = {
     return undefined
   },
   // cordis 的延迟注入：依赖就绪后回调带一个 scoped ctx。
-  // 本插件用它注册运行期上下文快照，并捕获 `llm` 供轮末后台总结使用。
+  // 本插件用它注册工具、运行期上下文快照，并捕获 `llm` 供轮末后台总结使用。
+  //
+  // ⚠️ 必须按 deps **分派**，不能无条件把什么都塞进 scope：
+  // 真实 cordis 只在依赖齐备时才回调，无条件回调会让"漏声明依赖"这类
+  // bug 在桩里被掩盖（例如路由误从根 ctx 取 webServer）。
   inject(deps, fn) {
-    const scope = {
-      ...ctx,
+    const available = {
+      tools: {
+        register(definition) {
+          toolNames.push(definition.name)
+          return () => {}
+        },
+      },
       llm: { stream: async function* () {} },
       systemPrompt: {
         context(spec) {
@@ -82,7 +100,16 @@ const ctx = {
           return () => {}
         },
       },
+      webServer: {
+        register(route) {
+          routes.push(route)
+          return () => {}
+        },
+      },
     }
+    // 与真 cordis 一致：任何一个依赖缺失就不回调。
+    if (!deps.every((d) => available[d] !== undefined)) return { dispose: () => {} }
+    const scope = { ...ctx, ...Object.fromEntries(deps.map((d) => [d, available[d]])) }
     fn(scope)
     return { dispose: () => {} }
   },
@@ -101,12 +128,9 @@ const ctx = {
     fn()
     return () => {}
   },
-  webServer: {
-    register(route) {
-      routes.push(route)
-      return () => {}
-    },
-  },
+  // ⚠️ 根 ctx **故意不提供 webServer** —— 路由必须经 `ctx.inject(['webServer'], …)`
+  // 的 scope 拿到。在这里再放一个 webServer 会掩盖「误从根 ctx 取服务」这类 bug，
+  // 而真实 cordis 里根 ctx 上根本没有这个属性（它由 dsh-web-app bundle 的插件行提供）。
 }
 
 console.log('\napply()')
@@ -115,6 +139,8 @@ mod.apply(ctx, {})
 check('注册了 HTTP 路由', routes.length, 1)
 check('路由 kind', routes[0].kind, 'prefix')
 check('路由 path', routes[0].path, '/memory-md')
+// 路由必须来自注入的 webServer scope，而不是根 ctx（根 ctx 没这个属性）。
+check('路由来自注入的 scope', routes[0] !== undefined, true)
 
 // 工具注册是异步的（defineTool 惰性解析），等一个微任务队列。
 await new Promise((resolve) => setTimeout(resolve, 50))
@@ -234,6 +260,76 @@ console.log('\n索引冻结：缓存上一次渲染的文本，返回值恒定�
 // apply() 内部对工具注册失败只 warn 不抛 —— 这里确保没有静默降级。
 console.log('\napply() 期间没有告警')
 check('无告警', warnings, [])
+
+/* ---------- 依赖晚就绪：tools 必须能补注册 ----------
+ *
+ * 顶层 `inject` 是空数组，所以 `apply()` 在**任何依赖就绪之前**就跑。
+ * 若此时用 `ctx.get('tools')` 直接取，拿到 undefined 就**永久**注册不上工具
+ * ——而装载顺序取决于 profile 的 bundles 列表，把正确性押在"我们的行排在 tools
+ * 之后"是脆弱的（实测：tools 晚就绪时 5 个工具全丢）。
+ *
+ * 改成 `ctx.inject(['tools'], …)` 后，依赖**出现时**才回调，晚就绪也能补上。
+ * 这条断言锁住它 —— 谁把 `ctx.inject(['tools'])` 改回 `ctx.get('tools')`，
+ * 这里立刻变红。
+ */
+console.log('\n依赖晚就绪：tools 后到也要补注册（防回归）')
+{
+  const lateTools = []
+  const lateRoutes = []
+  const lateSections = []
+  const lateWarnings = []
+
+  // 一个「tools 尚未就绪」的 ctx：先记下注入回调，等服务出现再触发。
+  const pendingInjects = []
+  const lateCtx = {
+    logger: { warn: (m) => lateWarnings.push(String(m)), info: () => {} },
+    get(name) {
+      // ⚠️ 关键：这里**永远返回 undefined** —— 模拟 apply() 跑时服务都还没装载。
+      // 旧实现（ctx.get('tools')）在这一步就永久丢掉了工具注册。
+      if (name === 'sessions') return { get: () => undefined, list: () => [] }
+      return undefined
+    },
+    inject(deps, fn) {
+      pendingInjects.push({ deps, fn })
+      return { dispose: () => {} }
+    },
+    on() { return () => {} },
+    emit() { return true },
+    effect(fn) { fn(); return () => {} },
+  }
+
+  mod.apply(lateCtx, {})
+
+  // apply() 已跑完。此刻**只有**真正声明了依赖的注入会被登记下来。
+  const declaredDeps = pendingInjects.map((p) => p.deps.join(','))
+  check('tools 走延迟注入（而不是 apply 期直接取）', declaredDeps.includes('tools'), true)
+
+  // 现在让服务"晚到"，逐个触发对应回调。
+  const services = {
+    tools: { register: (d) => { lateTools.push(d.name); return () => {} } },
+    systemPrompt: {
+      section: (s) => { lateSections.push(s); return () => {} },
+      context: () => () => {},
+    },
+    llm: { stream: async function* () {} },
+    webServer: { register: (r) => { lateRoutes.push(r); return () => {} } },
+  }
+  for (const { deps, fn } of pendingInjects) {
+    if (deps.every((d) => services[d] !== undefined)) {
+      fn({ ...lateCtx, ...Object.fromEntries(deps.map((d) => [d, services[d]])) })
+    }
+  }
+
+  check('迟到的 tools 也注册了五个工具', lateTools.sort(), [
+    'memory_md_forget',
+    'memory_md_journal',
+    'memory_md_read',
+    'memory_md_save',
+    'memory_md_search',
+  ])
+  check('迟到的 systemPrompt 也注册了提示词段', lateSections.length, 1)
+  check('迟到的 webServer 也注册了路由', lateRoutes.length, 1)
+}
 
 try {
   rmSync(SANDBOX, { recursive: true, force: true })

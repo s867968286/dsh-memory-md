@@ -6,7 +6,7 @@
  * 2. 写入永远落在 `<dshHome>/memory-md/`，**绝不会**落到工作区；
  * 3. 索引由插件维护，模型不必（也不能）自己拼路径。
  */
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -306,6 +306,32 @@ try {
       check('临时名带随机后缀', usesRandom, true)
       const fixedPidOnly = /const tmp = `\$\{path\}\.\$\{process\.pid\}\.tmp`/.test(src)
       check('不再使用仅含 pid 的固定名', fixedPidOnly, false)
+
+      // ⭐ settings.mjs 曾经漏掉了同一个修复（自己拼 `${file}.${pid}.tmp`），
+      // 而同进程并发写设置会共用临时文件、后写覆盖先写 —— 一次更新静默消失。
+      // 现在它复用 writeAtomic。这条断言锁住「两处原子写都不再自拼临时名」。
+      const settingsSrc = readFileSync(new URL('../src/settings.mjs', import.meta.url), 'utf8')
+      check('settings 复用 writeAtomic', /writeAtomic\(paths\.settingsFile/.test(settingsSrc), true)
+      check('settings 不再自拼固定临时名', /\$\{paths\.settingsFile\}\.\$\{process\.pid\}\.tmp/.test(settingsSrc), false)
+    }
+
+    console.log('\n并发写设置不丢更新（与记忆同一套原子写）')
+    {
+      // 契约级验证：8 次并发部分更新，值必须合法且文件未被写坏。
+      const { readSettings: rs, writeSettings: ws, resolvePaths: rp2 } = await import('../src/settings.mjs')
+      const paths2 = rp2(SANDBOX)
+      const results = await Promise.all(
+        Array.from({ length: 8 }, (_, i) => Promise.resolve().then(() =>
+          ws(paths2, { minReviewTurns: i + 1 }),
+        )),
+      )
+      const final = rs(paths2)
+      check('设置文件可解析（未被写坏）', Number.isInteger(final.minReviewTurns), true)
+      check('值在合法范围内', final.minReviewTurns >= 1 && final.minReviewTurns <= 8, true)
+      check('每次调用都返回归一化结果', results.every((r) => Number.isInteger(r.minReviewTurns)), true)
+      // 不留垃圾临时文件
+      const leftovers = readdirSync(paths2.memoryRoot).filter((f) => f.endsWith('.tmp'))
+      check('没有残留临时文件', leftovers, [])
     }
 
     writeSettings(rp(SANDBOX), { journal: false })
