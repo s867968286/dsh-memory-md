@@ -39,7 +39,12 @@ function makeReact() {
   let dirty = false
   return {
     api: {
-      createElement: (type, props, ...children) => ({ type, props: { ...(props ?? {}), children } }),
+      createElement: (type, props, ...children) => {
+        // 像真 React 一样展开函数型组件（官方 Switch 就是一个函数组件）。
+        // 不展开的话它只会留下一个 type=函数 的哑节点，测试就数不到 role="switch"。
+        if (typeof type === 'function') return type({ ...(props ?? {}), children })
+        return { type, props: { ...(props ?? {}), children } }
+      },
       useState(init) {
         const i = cursor++
         if (hooks[i] === undefined) hooks[i] = typeof init === 'function' ? init() : init
@@ -97,6 +102,21 @@ const STATE = {
   errorLogFile: 'C:/x/.dsh/memory-md/error.log',
 }
 
+/**
+ * 假的官方 Switch：与真实组件对外暴露的形状一致 ——
+ * `role="switch"`、`aria-checked` 由 `checked` 映射而来。
+ * 官方实现是 `role:"switch","aria-checked":checked`，这里照抄这个映射，
+ * 否则「开关状态跟随 settings」那几条断言会被假组件本身骗过。
+ */
+const makeSwitch = () => function Switch(props) {
+  const p = props ?? {}
+  return {
+    type: 'Switch',
+    props: { ...p, role: 'switch', 'aria-checked': p.checked === true },
+    children: [],
+  }
+}
+
 const React = makeReact()
 let exported = null
 const win = {
@@ -104,6 +124,7 @@ const win = {
     load: (spec) => {
       exported = spec.factory((name) => {
         if (name === 'react') return React.api
+        if (name === '@deepseek-ai/dsh-client-ui-primitives') return { Switch: makeSwitch() }
         throw new Error(`unexpected require: ${name}`)
       })
     },
@@ -230,6 +251,7 @@ if (root) {
     let exp2 = null
     const win2 = { __ModuleLoader__: { load: (spec) => { exp2 = spec.factory((n) => {
       if (n === 'react') return makeReact().api
+      if (n === '@deepseek-ai/dsh-client-ui-primitives') return { Switch: makeSwitch() }
       throw new Error(`unexpected require: ${n}`)
     }) } } }
     new Function('window', 'document', 'fetch', 'module', 'exports', source)(win2, doc, fetchBare, {}, {})

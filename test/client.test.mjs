@@ -2,11 +2,13 @@
  * client.test.mjs — 静态检查 client 半的外部依赖与注册契约。
  *
  * 背景（真事故）：两个设置页都变成「裸 HTML」。根因是它们的 client 顶层
- * `require('@deepseek-ai/dsh-client-ui-primitives')`，而该包在当前 DSH 版本
- * 里**已不存在**。factory 一抛错，`apply` 就从不执行 → 样式永不注入 → 整页裸样式。
+ * `require('@deepseek-ai/dsh-client-ui-primitives')`，而**当时**该包在 DSH 里
+ * 已不存在。factory 一抛错，`apply` 就从不执行 → 样式永不注入 → 整页裸样式。
  *
- * 教训：client 半的任何外部 `require` 都必须先确认包真的存在。这个测试把
- * 「能用哪些模块」写成显式白名单，新增依赖必须同时改这里。
+ * 现状（2026-10-19 更新）：该包在 0.2.1-rc.2 里回来了，是前端 shell 的静态
+ * 模块（与 `slots`、`dockkit` 并列），因此 `Switch` 恢复可用。但**上面那条
+ * 教训不变**：client 半新增任何外部 `require` 都要先确认它真的存在，并同步
+ * 更新下面的白名单 —— 这正是这个测试存在的理由。
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -33,7 +35,12 @@ const check = (name, actual, expected) => {
  * 只列**实际 require 的**：`dsh-client-ui-settings` 是 package.json 里
  * `dsh.client.inject` 的声明（表示依赖该插件先加载），不是 require 目标。
  */
-const ALLOWED = new Set(['react'])
+const ALLOWED = new Set([
+  'react',
+  // 设置页的开关改用官方 Switch（自绘那份的圆角与「通用设置」对不上）。
+  // 该包是前端 shell 的静态模块，已确认其导出含 Switch。
+  '@deepseek-ai/dsh-client-ui-primitives',
+])
 
 console.log('\n外部依赖白名单')
 {
@@ -47,9 +54,10 @@ console.log('\n外部依赖白名单')
 
   check('只 require 白名单内的模块', unique, [...ALLOWED].sort())
 
-  // 明确点名已消失的包，防止有人又照抄回去。
-  const banned = '@deepseek-ai/dsh-client-ui-primitives'
-  check(`不再引用已消失的 ${banned}`, unique.includes(banned), false)
+  // 白名单之外一个都不许有：曾经就是多 require 了一个当时不存在的包，
+  // 导致整个 factory 抛错、apply 从不执行，设置页变成裸 HTML。
+  const unexpected = unique.filter((name) => !ALLOWED.has(name))
+  check('没有白名单之外的 require', unexpected, [])
 }
 
 console.log('\n注册契约')

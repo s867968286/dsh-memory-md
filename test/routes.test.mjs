@@ -204,6 +204,23 @@ try {
     check('坏值字段本身回落', mixed.minReviewTurns, 2)
   }
 
+  console.log('\n请求体超限被拒（413）——无上限时失控请求能用无限流吃满内存')
+  {
+    const { route } = makeHarness()
+    // 64KB 上限；body 是**合法的** JSON 对象 —— 旧实现（无上限）会正常 200，
+    // 只有新实现才回 413，断言不会因为"恰好也该 400"而假绿。
+    const big = { pad: 'x'.repeat(80 * 1024), minReviewTurns: 7 }
+    const before = JSON.parse(
+      await import('node:fs').then((fs) => fs.readFileSync(join(SANDBOX, 'memory-md', 'settings.json'), 'utf8')),
+    )
+    const res = await callRoute(route, '/api/settings', 'PUT', big)
+    check('超限回 413', res.status, 413)
+    const after = JSON.parse(
+      await import('node:fs').then((fs) => fs.readFileSync(join(SANDBOX, 'memory-md', 'settings.json'), 'utf8')),
+    )
+    check('超限请求不落盘（minReviewTurns 仍为旧值）', after.minReviewTurns, before.minReviewTurns)
+  }
+
   console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`)
 } finally {
   rmSync(SANDBOX, { recursive: true, force: true })

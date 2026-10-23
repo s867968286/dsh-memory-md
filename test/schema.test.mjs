@@ -29,7 +29,7 @@ const check = (name, actual, expected) => {
 
 /* ---------- 从 DSH 安装目录拿真实校验器 ---------- */
 const dshRequire = createRequire(
-  'D:/soft/node/node-v22.23.2/node_modules/@deepseek-ai/dsh/package.json',
+  'D:/soft/node/node-v24.21.0/node_modules/@deepseek-ai/dsh/package.json',
 )
 const { assertSupportedJsonSchema, validateJsonSchemaValue } = dshRequire('@deepseek-ai/dsh-tools')
 
@@ -111,6 +111,25 @@ try {
       }
     }
     check('属性节点无残留 required', offenders, [])
+  }
+
+  console.log('\n非 object 数组元素透传（W4 回归：曾把 items 当 properties 错译）')
+  {
+    const { normalizeOutputSchema } = await import('../src/schema.mjs')
+    const schema = normalizeOutputSchema({
+      type: 'object',
+      properties: {
+        tags: { type: 'array', required: true, items: { type: 'string', required: true } },
+      },
+    })
+    check('string 元素保持 string', schema.properties.tags.items.type, 'string')
+    check('string 元素没有被包成对象', schema.properties.tags.items.properties, undefined)
+    check('元素上的 required 被剥掉', schema.properties.tags.items.required, undefined)
+    check('数组自身的 required 上提到根', schema.required, ['tags'])
+    // 透传后的形状仍要过 DSH 真实校验器 —— 本套件的立套之本。
+    let ok = true
+    try { assertSupportedJsonSchema(schema) } catch { ok = false }
+    check('透传后的 schema 过真实校验器', ok, true)
   }
 
   console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`)

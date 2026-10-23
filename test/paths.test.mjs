@@ -79,6 +79,18 @@ console.log('\nresolveScopes：slug 规则与目录布局')
   check('project 日志在 .journal 子目录', s.project.journalDir.endsWith('.journal'), true)
 }
 
+console.log('\nresolveScopes：中文工作区路径不得塌缩成同一个作用域')
+{
+  // 回归：旧实现用 `[^A-Za-z0-9]+` 当分隔符，含中文的路径会整体塌缩成盘符 `d`，
+  // 于是所有中文项目共用 `~/.dsh/memory-md/d/`，记忆跨项目串味。
+  const a = resolveScopes({ cwd: 'D:\\测试中文路径', dshHome: 'C:\\h\\.dsh' })
+  const b = resolveScopes({ cwd: 'D:\\坚果云工作日志', dshHome: 'C:\\h\\.dsh' })
+  check('中文路径 slug 保留中文', a.slug, 'd-测试中文路径')
+  check('中文路径作用域目录带中文', a.project.dir, 'C:\\h\\.dsh\\memory-md\\d-测试中文路径')
+  check('不同中文项目作用域不同', a.project.dir !== b.project.dir, true)
+  check('中文项目不与盘符同目录', a.project.dir !== 'C:\\h\\.dsh\\memory-md\\d', true)
+}
+
 console.log('\nresolveScopes：posix 路径与边界')
 {
   const p = resolveScopes({ cwd: '/home/me/proj', dshHome: '/home/me/.dsh' })

@@ -25,6 +25,7 @@ import {
   appendJournalEntries,
   countEntries,
   deleteMemory,
+  indexEntryFor,
   listMemoryFiles,
   memoryFilePath,
   normalizeMemoryFile,
@@ -99,9 +100,76 @@ function dirFor(scope, memoryRoot, scopes) {
   return scopes.project.dir
 }
 
+/**
+ * 在给定的作用域集合里按文件名找记忆，返回命中的作用域与正文。
+ *
+ * 索引在作用域**根**、正文在 `memory/` 子目录 —— 两条路径必须分开拼：
+ * 曾统一走 `memoryFilePath()` 把索引也拼进子目录，导致永远读不到（E1）。
+ */
+function findMemory(file, targets) {
+  for (const [scope, dir] of targets) {
+    const path = file === MEMORY_ENTRYPOINT ? join(dir, MEMORY_ENTRYPOINT) : memoryFilePath(dir, file)
+    const text = readText(path)
+    if (text !== undefined) return { scope, text }
+  }
+  return undefined
+}
+
+/** 所有可能存在记忆的作用域目录，**不受本次 scope 参数限制**。 */
+function everyScopeTarget(memoryRoot, scopes) {
+  const all = [['global', join(memoryRoot, 'global')]]
+  if (scopes !== undefined) all.push(['project', scopes.project.dir])
+  return all
+}
+
 /** 从 description 里抽出用于索引的标题。 */
 function titleOf(meta, file) {
   return meta.name || file.replace(/\.md$/, '')
+}
+
+/**
+ * `memory_md_read` 找不到记忆时的报错文案。
+ *
+ * ## 为什么不能只说「没有这条记忆」
+ *
+ * 原文案（`没有这条记忆 "<file>"`）把「**所选作用域内**没有」说成了「不存在」。
+ * 踩过的实例：`project_社保国产化工作区与开发环境速查.md` 实际住在 global，
+ * 模型按 `scope=project` 去找，收到「没有这条记忆」后合理地判断成记忆丢失
+ * 或文件名记错，而不是"作用域传错了"。
+ *
+ * ## 作用域与类型是两件正交的事
+ *
+ * 文件名前缀（`project_` / `feedback_` …）是 **type** 分类标签，与 **scope**
+ * 无关 —— `project_xxx.md` 住在 global 完全合法。模型最容易在这里串味，
+ * 所以报错要把两者分开讲，并在别的作用域确实有这条时直接给出可用的调用。
+ */
+function describeReadMiss(file, want, memoryRoot, scopes, targets) {
+  const scopeText = want === 'all'
+    ? '所有作用域'
+    : `作用域 ${want}`
+  // 「作用域 project 里」要空格、中文与英文单词相邻要留白；「所有作用域里」不要。
+  const where = want === 'all' ? `${scopeText}里` : `${scopeText} 里`
+  const lines = [`memory_md_read: ${where}没有记忆 "${file}"。`]
+
+  // 别处有 → 直接告诉他怎么读，省掉一轮试错。
+  const elsewhere = findMemory(file, everyScopeTarget(memoryRoot, scopes)
+    .filter(([scope]) => !targets.some(([t]) => t === scope)))
+  if (elsewhere !== undefined) {
+    lines.push(
+      `它存在，但在另一个作用域里：${elsewhere.scope}。`,
+      `改用 scope="${elsewhere.scope}" 重试（scope 决定的是存储位置，与文件名前缀无关）。`,
+    )
+    return lines.join('\n')
+  }
+
+  // 该作用域存在但这条不在。把口径讲清楚，别让模型去猜文件名。
+  lines.push(
+    `作用域（scope：global / project）与记忆类型（type：${TYPES.join(' / ')}）是两回事 ——`,
+    `文件名里的前缀只是 type 标签，不代表它属于哪个作用域。`,
+    `先用 memory_md_read 的列表模式（或 memory_md_search）确认它在哪个作用域，`,
+    `再按该作用域调用；文件名不确定时也以列表里的为准。`,
+  )
+  return lines.join('\n')
 }
 
 /**
@@ -151,6 +219,9 @@ export function registerMemoryTools({ tools, config, logger }) {
       '- project：本工作区进行中的工作、决定、期限',
       '- reference：外部系统的指针（issue 跟踪器、看板、主机）',
       '',
+      '`type` 是**分类标签**（同时进文件名前缀），`scope` 是**存储位置** —— 两者正交：',
+      'type=project 的记忆既可以存 project 作用域，也可以存 global。按"换个工作区还成立吗"选 scope，按"这是哪一类"选 type。',
+      '',
       '**不要存**：代码写法或文件结构（读仓库就知道）、git 历史、调试配方、',
       '临时状态、以及任何你没验证过的东西。除非用户明确要求，不要存密钥。',
       '',
@@ -167,18 +238,21 @@ export function registerMemoryTools({ tools, config, logger }) {
         required: true,
         enum: ['global', 'project'],
         description:
-          'global = 跨所有项目的用户级记忆（角色、偏好、反馈）。project = 仅当前工作区（它的决定、期限、系统）。',
+          '存到哪个作用域（=存储位置，与 type 无关）。global = 跨所有项目通用、换工作区仍然成立；project = 只在当前工作区成立。',
       },
       type: {
         type: 'string',
         required: true,
         enum: TYPES,
-        description: '这条记忆属于哪一类；同时决定文件名前缀。',
+        description:
+          '这条记忆属于哪一类（=分类标签，与 scope 无关，同时决定文件名前缀）。不要因为 type 叫 project 就选 scope=project。',
       },
       name: {
         type: 'string',
         required: true,
-        description: '简短的人类可读标题，例如「包管理器选择」。会显示在记忆索引里。',
+        description:
+          '简短的人类可读标题，例如「包管理器选择」。会显示在记忆索引里。' +
+          '只写标题本身：不要带 type 前缀（不要写 "feedback_xxx"），也不要带 ".md" 后缀 —— 前缀与扩展名由插件自己加。',
       },
       description: {
         type: 'string',
@@ -236,6 +310,14 @@ export function registerMemoryTools({ tools, config, logger }) {
         ? normalizeMemoryFile(args.file)
         : undefined
       if (args.file !== undefined && String(args.file).trim() && requested === undefined) {
+        // 注意 requested === undefined 有两种：非法名，以及保留名 MEMORY.md
+        // （索引不是正文，见 `isEntrypointName`）。这里只该说非法名的情况。
+        if (String(args.file).trim() === MEMORY_ENTRYPOINT) {
+          throw new Error(
+            `memory_md_save: "${MEMORY_ENTRYPOINT}" 是记忆索引，由插件独占维护，不能当正文覆盖。` +
+            `要新增或修改记忆，请省略 file（自动派生），或传列表里的记忆文件名。`,
+          )
+        }
         throw new Error(
           `memory_md_save: "${String(args.file).trim()}" 不是合法的记忆文件名。` +
           `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,
@@ -387,12 +469,18 @@ export function registerMemoryTools({ tools, config, logger }) {
       `省略 "file" 时会列出每条记忆的标题、类型和描述 —— 这是在检索之前`,
       `了解已知内容最省事的方式。每个作用域的 ${MEMORY_ENTRYPOINT} 索引也`,
       `在这份列表里。`,
+      '',
+      '**scope 与 type 是两件正交的事，别混**：',
+      '- `scope`（global / project）= 这条记忆**存在哪**，决定去哪个目录找；',
+      `- \`type\`（${TYPES.join(' / ')}）= 这条记忆**是哪一类**，只是文件名前缀。`,
+      '文件名带 `project_` 前缀不代表它属于 project 作用域 —— 它完全可能住在 global。',
+      '所以不要用文件名前缀去推断 scope；列表里的 `作用域/文件名` 前缀才是权威。',
     ].join('\n'),
     parameters: {
       scope: {
         type: 'string',
         enum: ['all', 'global', 'project'],
-        description: '读哪个存储。默认 "all"。',
+        description: '去哪个作用域找（global=跨项目，project=仅当前工作区）。默认 "all" —— 不确定时就用默认值，它会同时搜两个作用域。',
       },
       file: {
         type: 'string',
@@ -446,27 +534,42 @@ export function registerMemoryTools({ tools, config, logger }) {
         targets.push(['project', scopes.project.dir])
       }
 
-      const file = typeof args.file === 'string' && args.file.trim()
-        ? normalizeMemoryFile(args.file)
+      // `MEMORY.md` 是合法入参（读索引），但 `normalizeMemoryFile()` 会把保留名
+      // 拒成 undefined（save/forget 依赖这道闸）—— 所以这里先单独放行它。
+      const rawFile = typeof args.file === 'string' && args.file.trim()
+        ? args.file.trim()
         : undefined
+      const file = rawFile === undefined
+        ? undefined
+        : rawFile === MEMORY_ENTRYPOINT
+          ? MEMORY_ENTRYPOINT
+          : normalizeMemoryFile(rawFile)
 
-      if (args.file !== undefined && String(args.file).trim() && file === undefined) {
+      if (rawFile !== undefined && file === undefined) {
         throw new Error(
-          `memory_md_read: "${String(args.file).trim()}" 不是合法的记忆文件名。` +
+          `memory_md_read: "${rawFile}" 不是合法的记忆文件名。` +
           `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,
         )
       }
 
       if (file !== undefined) {
-        for (const [scope, dir] of targets) {
-          const text = readText(memoryFilePath(dir, file))
-          if (text !== undefined) return Promise.resolve({ entries: [], text })
-        }
-        throw new Error(`memory_md_read: 没有这条记忆 "${file}"`)
+        const hit = findMemory(file, targets)
+        if (hit !== undefined) return Promise.resolve({ entries: [], text: hit.text })
+
+        // 没找到。报错必须同时说清两件正交的事，否则模型会误判成「记忆丢了」
+        // 并去改文件名：
+        //   1. **作用域**（scope）：在所选作用域里没有 —— 别处有就点出来；
+        //   2. **类型**（type）：文件名前缀只是分类标签，与 scope 无关，
+        //      带 `project_` 前缀的记忆完全可以住在 global（这正是踩过的坑）。
+        throw new Error(describeReadMiss(file, want, memoryRoot, scopes, targets))
       }
 
       const entries = []
       for (const [scope, dir] of targets) {
+        // 列表含索引条目：与"file 可传 MEMORY.md"的契约、与搜索扫索引的口径一致。
+        // 必须把 scope 传进去 —— 输出 schema 要求每条都有它，索引条目是唯一
+        // 不由下面那段拼的条目，漏传会让 `scope=all`（默认值）整块校验失败。
+        entries.push(...indexEntryFor(dir, scope))
         for (const f of listMemoryFiles(dir)) {
           const raw = readText(memoryFilePath(dir, f)) ?? ''
           const { data } = parseMemoryFrontmatter(raw)
@@ -554,6 +657,13 @@ export function registerMemoryTools({ tools, config, logger }) {
 
       const file = typeof args.file === 'string' ? normalizeMemoryFile(args.file) : undefined
       if (!file) {
+        // 同 save：非法名与保留名分开说 —— 对索引说"文件名不合法"会误导模型。
+        if (String(args.file ?? '').trim() === MEMORY_ENTRYPOINT) {
+          throw new Error(
+            `memory_md_forget: "${MEMORY_ENTRYPOINT}" 是记忆索引，不能删除。` +
+            `删除记忆请传列表里的记忆文件名（如 "feedback_testing.md"）。`,
+          )
+        }
         throw new Error(
           `memory_md_forget: "${String(args.file ?? '').trim()}" 不是合法的记忆文件名。` +
           `只写文件名本身，例如 "feedback_testing.md"（索引里的 "memory/xxx.md" 去掉 "memory/" 即可）。`,

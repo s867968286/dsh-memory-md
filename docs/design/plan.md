@@ -4,7 +4,7 @@
 > **本文件记录定案与修订历史，不是需求真源** —— 需求真源是用户；**当前实现以源码为准**
 > 更新：2026-09-14
 > 参考实现：CodeBuddy Code（主）/ WorkBuddy（辅）
-> 依据文档：`docs/memory-scheme-codebuddy.md`、`docs/memory-scheme-workbuddy.md`、`docs/memory-scheme-comparison.md`
+> 依据文档：`docs/research/memory-scheme-codebuddy.md`、`docs/research/memory-scheme-workbuddy.md`、`docs/research/memory-scheme-comparison.md`
 
 ### 修订记录
 
@@ -65,10 +65,13 @@
 
 ### slug 规则
 
-沿用 CodeBuddy `getCompressedWorkDir()`：绝对路径盘符与分隔符转 `-`、全小写。
+沿用 CodeBuddy `getCompressedWorkDir()`：绝对路径盘符与分隔符转 `-`、全小写；
+**唯一偏离上游的一点是非 ASCII 字符原样保留**（上游把它们当分隔符抹掉，会让所有
+中文路径塌缩成同一个盘符目录）。
 
 ```
 D:\workspaces\ai\dsh-memory-md  →  d-workspaces-ai-dsh-memory-md
+D:\坚果云工作日志                →  d-坚果云工作日志
 ```
 
 ---
@@ -635,7 +638,7 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
 | **搜索指引** | 不塞内容，写死"用什么工具搜哪个目录" |
 | **层级加载** | 用户级 → 项目级，项目优先级更高 |
 | **行数限制** | 200 行 |
-| **slug 压缩规则** | 路径转 `-`、小写 |
+| **slug 压缩规则** | 路径转 `-`、小写；中文等非 ASCII 原样保留 |
 | **global 概念** | 全局记忆独立目录 |
 
 ### 从 WorkBuddy 抄
@@ -763,7 +766,7 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
 | `<examples>` 逐条照搬 | 那些例子是英文的通用编码场景（data scientist、Linear、Grafana），与中文 DSH 语境错配；四类的判据已用中文写清，例子留白让模型自行归纳 |
 | `Use the Write and Edit tools` / `write to it directly with the Write tool` | 依赖 CodeBuddy 的通用文件工具；我们的模型**不能传路径** |
 | grep `*.jsonl` 会话转录 | DSH 的会话日志是 `session.jsonl.zstd` 压缩格式，直接 grep 不可行 |
-| 语义召回（`memory-selector` + `injectRelevantMemories`） | 已定案「一期不做」（见 `docs/memory-scheme-codebuddy.md`）；且它需要额外的 LLM 调用与索引基础设施 |
+| 语义召回（`memory-selector` + `injectRelevantMemories`） | 已定案「一期不做」（见 `docs/research/memory-scheme-codebuddy.md`）；且它需要额外的 LLM 调用与索引基础设施 |
 | 子代理形态的抽取（`MemoryExtractionService` 用真子代理） | 我们的独立 `llm.stream()` 无工具、不建 session、不递归 —— 更简单且规避了递归风险 |
 | 冻结快照 `(0,nn.VU)(...)` | CodeBuddy 因为不热重载才需要；我们每次装配重读磁盘 |
 | 按 mtime 只取最近 N 个文件喂 manifest | 我们的 `MANIFEST_MAX_ENTRIES = 200` 已经够用；它的截断是为控制子代理提示词体积 |
@@ -791,9 +794,9 @@ LLM 调用（agent 名 `memorySelector`），由它返回相关文件名。
 
 | 文档 | 内容 |
 |---|---|
-| `docs/plan.md` | 本文件，方案定案清单 |
-| `docs/memory-scheme-codebuddy.md` | CodeBuddy 记忆方案详细分析（源码级） |
-| `docs/memory-scheme-workbuddy.md` | WorkBuddy 记忆方案详细分析（源码级） |
-| `docs/memory-scheme-comparison.md` | 两方案对比总览 |
-| `docs/memory-research-six-implementations.md` | 六个同类实现的注入/沉淀机制研究 |
-| `docs/memory-research-preset-md-vs-references.md` | dsh-preset-md 与三个参考实现的对照 |
+| `docs/design/plan.md` | 本文件，方案定案清单 |
+| `docs/research/memory-scheme-codebuddy.md` | CodeBuddy 记忆方案详细分析（源码级） |
+| `docs/research/memory-scheme-workbuddy.md` | WorkBuddy 记忆方案详细分析（源码级） |
+| `docs/research/memory-scheme-comparison.md` | 两方案对比总览 |
+| `docs/research/memory-research-six-implementations.md` | 六个同类实现的注入/沉淀机制研究 |
+| `docs/research/memory-research-preset-md-vs-references.md` | dsh-preset-md 与三个参考实现的对照 |

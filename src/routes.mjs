@@ -26,9 +26,23 @@ function sendJson(res, status, payload) {
   res.end(body)
 }
 
+/**
+ * `/api/settings` 的请求体上限。
+ *
+ * 没有上限时，恶意/失控的本地请求可以用无限流把内存吃满。同源 localhost
+ * 风险本就低，这里只做便宜的长度闸：累计超过 64KB 直接放弃读流（返回
+ * undefined，调用方回 413），而不是把整个 body 缓完再判。
+ */
+const MAX_BODY_CHARS = 64 * 1024
+
 async function readJson(req) {
   const chunks = []
-  for await (const chunk of req) chunks.push(chunk)
+  let total = 0
+  for await (const chunk of req) {
+    total += chunk.length
+    if (total > MAX_BODY_CHARS) return undefined
+    chunks.push(chunk)
+  }
   const text = Buffer.concat(chunks).toString('utf8')
   if (!text.trim()) return null
   try {
@@ -37,11 +51,6 @@ async function readJson(req) {
   } catch {
     return null
   }
-}
-
-const statusOfError = (message) => {
-  if (/请求体|非法/.test(message)) return 400
-  return 500
 }
 
 /** 注册 `/memory-md` 前缀路由。
@@ -62,9 +71,8 @@ export function registerRoutes(ctx, config = {}) {
       await fn(req, res)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      const status = statusOfError(message)
-      if (status >= 500) ctx.logger?.warn?.(`[memory-md] 请求处理失败：${message}`)
-      sendJson(res, status, { error: message })
+      if (ctx.logger?.warn) ctx.logger.warn(`[memory-md] 请求处理失败：${message}`)
+      sendJson(res, 500, { error: message })
     }
   }
 
@@ -94,6 +102,11 @@ export function registerRoutes(ctx, config = {}) {
 
       if (rest === '/api/settings' && method === 'PUT') {
         const body = await readJson(req)
+        // null = 空/非法 JSON（400）；undefined = 请求体超限（readJson 以
+        // `MAX_BODY_CHARS` 闸区分，见上）。
+        if (body === undefined) {
+          return sendJson(res, 413, { error: '请求体超过大小上限' })
+        }
         if (!body) return sendJson(res, 400, { error: '请求体不是合法 JSON' })
         const settings = writeSettings(paths, body)
         // 让 Host 半丢弃已缓存的注入文本。

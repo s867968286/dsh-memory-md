@@ -73,6 +73,10 @@ ctx.systemPrompt.context({
 
 **去重是白拿的。** `dsh-agent-loop` 的 `RuntimeContextProjection.project()` 会比对上一次保留的快照文本，**内容未变则不产生任何消息** —— 所以「索引变了才注入、没变就不重复注入」由 loop 负责，插件不需要自己做跳过机制。
 
+**压缩会重新注入一次。** 自动压缩（`dsh-compaction-basic`）与 `/compact` 提交的都是 `surfaceOp.replace`，把历史里一段消息（含我们的快照）替换成摘要 checkpoint。loop 监听到这次替换后会把 `retained` 置空（`dsh-agent-loop/lib/index.js:325`），下一轮必然追加一份新快照 —— 但若不配合，追加的会是冻结缓存里那份**旧文本**。
+
+所以开启冻结时，缓存连带记住渲染那一刻的 `session.surface.replaceGeneration`：该计数只在 surface 发生 replace 时递增（`dsh-session/lib/index.js:464-468`），append（含我们自己的快照注入）不递增。代数变了＝历史被替换过＝缓存文本可能已不在历史里 → 重新读盘渲染并**重新缓存**。这比监听 `compaction/summary` 更通用：手动 `/compact` 走同一个后端方法 `ctx.compaction.compactNow()`（`dsh-command-compact/lib/index.js:48-58`），顺带覆盖工具结果裁剪这类 replace。取不到 session 时代数为 `undefined`，退化成纯冻结，与无此机制时行为一致。
+
 **索引带确定性标签。** 每份索引用 `<memory-index scope="global|project" cwd="…">` 裹住，模型不必靠上下文猜这段文本的边界和作用域：
 
 ```xml
@@ -185,17 +189,17 @@ D:\workspaces\ai\dsh-memory-md\memory_test.md
 ```markdown
 # 2026-09-13
 
-## 04:27:56
+## 04-27-56
 - 修了分隔符 bug —— 根因是并发写共用同一个临时文件名，后写的覆盖先写的，改成随机后缀。
 - 补了并发回归测试：8 次并发写入全部保留。
 
-## 04:27:57
+## 04-27-57
 - 加了后台总结：轮末起独立 LLM 调用，写记忆与日志，不往主对话塞消息。
 ```
 
 **为什么不是一句话流水账**：结论才是事后翻看时真正要找的东西。
 「研究了 X 的实现方式」看过等于没看；「X 用的是双块折叠，没有 section，所以不吃缓存优化」
-才能还原当时的判断。**判定标准见 `docs/plan.md` 第 7.3 节**（正面清单 + 负面清单）。
+才能还原当时的判断。**判定标准见 `docs/design/plan.md` 第 7.3 节**（正面清单 + 负面清单）。
 
 同一天分几次写的，一眼可见 —— 不必靠条目顺序去猜。
 
@@ -218,6 +222,170 @@ D:\workspaces\ai\dsh-memory-md\memory_test.md
 | `total` | 当天**累计**条目数 |
 
 > 早先只有一个 `entries`，返回的却是累计值 —— 连写两条时看到 `2` 会误以为「一次写了 2 条」，进而误判成丢数据。拆开后就没有歧义了。
+
+---
+
+## 二·一、命令：`/memory-check`
+
+全库体检。**只读** —— 出一份报告，不改任何记忆文件。
+
+```
+/memory-check
+```
+
+### 它查什么
+
+分两段，结果在报告里分开列，出问题能一眼看出是机械判据还是模型判断在报。
+
+**一、结构问题（规则判定，确定性、零 token）**
+
+| 判据 | 级别 | 说明 |
+|---|---|---|
+| `索引死链` | error | 索引里有这一行，但 `memory/<file>` 不存在 |
+| `索引超限` | error | 索引超过 **200 行或 4e4 字符** —— 超出部分注入时被**截断**，那些记忆模型看不到 |
+| `缺 frontmatter` | error | 没有 frontmatter，`name`/`description`/`type` 全丢 |
+| `逐字重复` | error | 两条正文**完全一样**，是同一份内容的副本 |
+| `frontmatter 缺字段` | warn | 缺 `name` / `description` / `type` 之一 |
+| `type 非法` | warn | 不是 `user` / `feedback` / `project` / `reference` |
+| `type 与文件名不符` | warn | 文件名前缀与 frontmatter 的 `type` 对不上 |
+| `文件名与内容错配` | warn | 文件名的语义与 `name` 的语义**零交集**（借名） |
+| `正文为空` / `描述过长` | warn | 只有 frontmatter；description 远超「一行约 150 字」 |
+| `相对时间` | warn | 正文出现「昨天」「上个月」这类指代，过一阵会读不懂 |
+| `标题相似` | warn | 同作用域内两条标题相似度 ≥ 62%，**可能**重复 |
+
+**二、内容问题（模型判定）** —— 一次独立 LLM 调用，判五类：`duplicate`（同一件事）/ `mergeable`（同主题但拆散了）/ `outdated`（曾经成立现在不成立）/ `wrong`（自相矛盾或标题正文不符）/ `vague`（空泛到没法照着做）。
+
+### 每条结论必须附「原文依据」
+
+体检模型**看不到代码库**，也没有任何工具 —— 它只拿到一段拼好的记忆文本。这意味着两件事：
+
+1. 它能判「这两条是不是同一件事」，因为那只需要文本；
+2. 它**判不了**「这条记忆是否已与现状漂移」，因为那要去查真实代码。
+
+所以这里有两条防线：
+
+**防线一：强制逐字引用。** 每条结论必须带 `quote`，且必须是该条记忆正文里的**逐字片段**。宿主自己比对 `fullBody.includes(quote)`，对不上就丢弃并计数。
+
+这一条挡的是「模型凭印象瞎猜」：只有 id 校验时，它能编 id 之外的一切；要求引用原文之后，它必须先找到支撑结论的那句话。
+
+`CHECKUP_SYSTEM` 里明确写了：
+
+> `- 抄不出来就说明**这条结论不该报** —— 不要凭印象下判断。`
+
+并且对最容易误报的 `outdated` 额外加了一句：
+
+> `⚠️ 这条最容易误报：**你无法访问代码库，所以「我猜它可能变了」不是证据**。`
+> `只有记忆**自己内部**就自相矛盾（例如正文说「用 4.6」，描述说「已升到 4.8」）时才算。`
+
+**引文校验区分两种失败**（这条很重要）：喂给模型的正文只有前 600 字，而校验拿的是完整正文。于是引文对不上有两种成因：
+
+| 情形 | 处理 |
+|---|---|
+| 完整正文里也没有 | **模型编的** → 丢弃，计入 `quoteMismatch` |
+| 完整正文里有、但位置在 600 字之后 | **我们自己截的**，不是模型错 → **保留**，报告标注「引文在正文 600 字之后，未喂给模型」 |
+
+不区分的话，会把「记忆太长」误判成「模型不可信」，把好结论一起扔掉。
+
+**防线二：把待复核清单投回主模型。** 光靠引用还不够 —— 引文只能证明「这句话在记忆里」，证明不了「这句话现在还对」。而体检模型没有工具，查不了。
+
+主模型不同：它有 `read` / `grep` / `glob` 全套工具，而且**已经在用户意图的上下文里**。所以体检跑完后，插件用 `agent.followup()` 把「待复核清单」投回去，让主模型自己去核对真实情况。
+
+只投**需要外部核对的**：
+
+- `outdated` / `wrong` → 值得去查；
+- `duplicate` / `mergeable` / `vague` → 读记忆本身就能判断，不投；
+- 且正文里必须出现**可检索的锚点**（反引号标识符、路径、版本号、包名）—— 没有锚点的条目，「去核实」会退化成无目标的全库 grep。
+
+投递的指令里写死了三条边界（不靠模型自觉）：
+
+```
+1. **只核实，不要修改任何记忆文件** —— 核实结果报告给用户，改不改由用户决定。
+2. 用 read / grep / glob 查**当前真实情况**（代码、配置、版本号）。
+3. **查不到就明确说「无法验证」**，不要因为「看起来像过期」就下结论。
+```
+
+投递是**可选**的（设置项 `checkupReviewByModel`，默认开）—— 它会额外起一轮对话，不想被打断可以关掉，只留报告。投递失败也不影响报告本身。
+
+> **为什么不用子代理**：`dsh-cc-haha-dream` 是用 fork 子代理做这件事的，它为此要处理父 agent 选取、provider 可用性、工具不支持时降级，超时默认 15 分钟。而我们要的判断（重复/空泛/矛盾）不需要看代码库 —— 一次 `llm.stream()` 就够；唯一需要看代码库的那类（漂移），交给**本来就在场的主模型**更省也更准。
+
+### 三条刻意的取舍
+
+**1. 只报不改。** 记忆是人工可读可改的 Markdown，本项目明确不做自动改写（防重复走「提示 + 警告」）。报告的结尾固定有一句「本报告不会改动任何记忆文件」。
+
+**2. 「有文件、无索引」不报。** 索引是**用户控制上下文体积的手段** —— 他会主动删掉某些索引行给后面的条目腾位置。把这种情况报成缺陷会诱导人去「修复」，而那正是被明确叫停过的行为。这一点在 `checkup.mjs` 的 `ruleCheck()` 里留了注释，免得后来的维护者以为漏写了。
+
+**3. 语义分析没跑成时，绝不说「没有问题」。** LLM 拿不到、路由缺失、调用报错时，报告写的是「结构检查通过，但内容分析未完成 —— **这不等于没有问题**」。反过来做（信息为空就当健康）是本功能最严重的失败模式：它给出的是一句没被验证过的保证，比直接失败更糟。
+
+### 为什么是命令而不是工具
+
+1. **它是人驱动的动作**。体检要跑一次全库 LLM 调用，让模型自己决定何时花这笔钱不合适；用户输入 `/memory-check` 才是明确授权。
+2. **不占工具位**。工具 schema 每份请求都要带，一个只有人类会用的能力放进去是纯开销。
+3. **结果直接显示给人看**。`CommandResult.text` 由 UI 直接渲染，不必先进模型上下文再转述。
+
+注册方式照抄官方 `/compact`（`dsh-command-compact`）：同样是一次长耗时后台动作、同样把结论作为 `text` 返回。
+
+### 借鉴来源
+
+**必须分清两件事**：本插件**从 CodeBuddy 移植而来**（记忆格式、提示词纪律、索引截断口径都源自它，见 `docs/research/memory-scheme-codebuddy.md`）；而 `/memory-check` 这个**事后整理能力**，是三个参考实现里**都没有**的，因此没有可移植的实现。下面区分「机制借鉴」与「只影响设计判断」。
+
+> 完整的调研底稿（含各家源码证据、实测关键词计数）见
+> [`docs/research/memory-research-dream-and-checkup.md`](docs/research/memory-research-dream-and-checkup.md)；
+> 全部文档的分类索引见 [`docs/README.md`](docs/README.md)。
+
+**一、真正写进代码的借鉴**
+
+| 借鉴点 | 来源 | 落点 |
+|---|---|---|
+| 「反思式整理」的整体形态（审视已有记忆 → 合并 → 修剪索引） | Claude Code `Dream`（提示词原文，`ccVersion 2.1.296`，四阶段 `Orient → Gather → Consolidate → Prune`） | `CHECKUP_SYSTEM` 的判据骨架与报告结构 |
+| 相对日期转绝对日期 | `Dream` Phase 3；CodeBuddy `when_to_save` | `relative-date` 判据（把叮嘱变成**确定性检测**） |
+| 索引是**指针**不是内容、一行约 150 字 | `Dream` Phase 4 | `long-description` 判据（>200 字报警） |
+| **非法结论单条丢弃、合法子集保留**（不整份作废） | `dsh-mneme` `validateDecisions` 的 `skipInvalid` | `parseCheckupOutput` 的 `dropped` + 报告「未覆盖」一节 |
+| **输出 id 必须与真实条目求交**（反幻觉） | `dsh-mneme` 的 evidence `intersect` | `knownIds.has(f)` 过滤 |
+| 结构化决策清单 + 严格校验 | `dsh-mneme` consolidation prompt | `CHECKUP_SYSTEM` 的固定 JSON 形状 |
+| `llm.stream()` + `finish.reason.kind` 判截断/失败 | 官方 `/compact` + 本项目既有 `summarize.mjs` | `semanticCheck` 的 chunk 处理 |
+
+**二、只影响设计判断、没有写进代码的**
+
+- **`Dream` 的 `Auto Dream` 三重门控**（24h 时间闸 + 至少 5 个新会话 + 文件锁）：**未采用**。那是自动后台触发的设计，本插件走手动命令，用不上。
+- **`dsh-prime-memory` 的 `memory_ruminate`**、**`dsh-auto-memory` 的 `memory_consolidate`**：只参考了「该不该提供手动入口」这一判断（结论：该提供），**分层 L1→L2→L3、容量驱动压缩等机制一条都没用**。
+- **`dsh-mneme` 的动作集**（`keep`/`merge`/`archive`/`conflict`/`update`）：**未采用**。它的动词是「改数据库」，本插件只出报告，动词对不上；本插件的 `duplicate`/`mergeable`/`outdated`/`wrong`/`vague` 是**诊断类别**，不是执行动作。
+- **CodeBuddy 的每轮抽取子代理**：**未采用**。那是写入侧机制，本插件已由后台总结承担。
+
+**三、本插件自己设计的（上述来源都没有）**
+
+- **二元组 Jaccard 标题相似度**（阈值 0.62）——参考实现全部无相似度阈值（mneme 用向量聚类，prime/auto 用召回候选）。
+- **`name-mismatch`（借名检测）**：文件名语义与 `name` 语义**零交集**。三款插件**都没有**这类检查（调研报告明确记为「未找到」）。
+- **`exact-duplicate`（逐字重复）**：整段逐字比对，比相似度更保守。
+- **`dangling-index`（索引死链）**、**`index-overflow`**：文件式记忆特有的故障，数据库式插件没有这个概念。
+- **「语义未跑成时绝不说没问题」**：自审时发现自身的 bug 后加的（见下节）。
+- **「有文件、无索引」刻意不报**：来自本项目用户的既定取舍（索引是他控制上下文体积的手段），不是任何插件。
+
+**三·五、调研盲区与处置（诚实记录）**
+
+第一轮调研按「`memory` 分类 + npm 下载量排序」取样，**系统性漏掉了最贴题的三个实现** ——
+它们没有 npm 包（`downloads` 恒为 `null`），按热度永远排不进前列。补查后找到两条**实质差距**，均已处置：
+
+| 差距 | 对标实现 | 处置 |
+|---|---|---|
+| 没有逐字证据引用（只校验 id 在清单里） | `@klarkxy/dsh-memory` 要求 `source.text.includes(quote)` | **已补**：结论必须带 `quote`，宿主校验逐字命中（见上节「每条结论必须附原文依据」） |
+| 没有子代理验证（只用裸 `llm.stream()` 喂记忆文本） | `dsh-cc-haha-dream` fork 只读子代理 | **改用主模型复核**：`agent.followup()` 把待复核清单投回主模型，由它用 `read`/`grep`/`glob` 核实 —— 不引入子代理基建 |
+
+其余遗漏（预览/应用分离 + revision 乐观锁、冷启动守卫、跨进程锁 token、`.history/` 版本备份、
+候选状态推导、删除墓碑）都属于「**若将来从只读报告扩展到自动改写**」才需要的基础设施，当前形态下不构成缺陷。
+详见 [`docs/research/memory-research-dream-and-checkup.md`](docs/research/memory-research-dream-and-checkup.md) 第六·五 / 六·六节。
+
+**四、关于 CodeBuddy 有没有「总结/整理」功能**
+
+实测 `@tencent-ai/codebuddy-code` v2.150.0 的 `dist/codebuddy.js`：`autoDream` **0 次**、`蒸馏`/`巩固` **各 0 次**；`dream` 仅 5 次且全是噪音（动画词表 `Dreaming`、域名 `dreamhosters.com`、MIME `vnd.dreamfactory`）；`consolidat` 7 次全属 **Insights 报告**的 `at-a-glance consolidation`，与记忆无关。
+
+它的实际做法是**写入时抽取**，不是事后整理：`memory_extraction_stop_hook`（`event = STOP`，每回合结束触发）→ `extractAsync` → `doExtract`（新增消息 `< 2` 即跳过；主代理已写过记忆也跳过）→ 一个**受限子代理**（只给 `Read/Grep/Glob/Write/Edit`，`maxTurns: 5`），提示词要求「只用最近约 N 条消息」。它的「去重/删过期」只写在那份提示词里：
+
+> - Update or remove memories that turn out to be wrong or outdated
+> - Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.
+
+`/memory` 命令只有 `toggle`（切换 `autoMemoryEnabled`），没有整理子命令。
+
+**结论**：CodeBuddy 没有 dream/定期整理功能，它对「去重、删过期、改错」的保障**全靠写入那一刻的子代理自觉**——只在那一轮看得见的几轮消息里判断，历史越久越管不到。`/memory-check` 是**全库、跨会话、事后**的视角，这是它结构上没有的能力。一个反向印证：CodeBuddy 同样把 `MEMORY.md` 限在 200 行 / 25KB（`truncateMemoryEntrypoint`，`em=200, ef=25e3`），但它只能靠提示词提醒模型自己压缩，本插件能用 `index-overflow` **确定性报出**。
 
 ### 写入是原子的
 
@@ -289,6 +457,14 @@ session、进会话列表、能调工具），还会再次触发 `agent/turn-sto
 4. **会话结束 force 触发** —— `agent/disposed` 时绕过门槛与防抖写一次，
    否则最后一段对话没有「下一轮」可以补。
 5. **失败可见** —— 失败写进 `error.log`（与 `settings.json` 同级），**不进 `.journal/`**。
+   解析拿不到结果时额外把**模型原始输出**存进 `diagnostics/`，并按实情分类
+   （`summary-call-failed` / `summary-empty-output` / `summary-truncated` /
+   `summary-unparsable`）—— 这几种的修法完全不同。
+   **`error.log` 里的措辞由实际发生的事决定，不是固定一句**：早先无条件写
+   「JSON 不完整或格式错误」，而实测最常见的是**调用失败**（`finish error`、
+   原文 0 字符），那时根本不存在 JSON —— 那句话会把排查引向"调大 maxTokens"的死路。
+   诊断文件含会话 id、模型、轮次、`finish` 终态、`failure` 详情（code/message/
+   status）、截断标记与原文，足够直接定位。
 
 全程 try/catch —— **任何异常都不得影响轮次收尾**。
 
@@ -344,6 +520,8 @@ node D:/workspaces/ai/dsh-memory-md/test/run.mjs
 ~/.dsh/memory-md/                    # Windows: C:\Users\<你>\.dsh\memory-md\
 ├── settings.json                    # 插件设置
 ├── error.log                        # 错误日志（与设置同级，排查看这层）
+├── diagnostics/                     # 后台总结失败时的原始输出（排查用，平时为空）
+│   └── 20261012-170620-a1b2c3d4-summary-unparsable.txt
 ├── global/                          # 用户级（跨项目）
 │   ├── MEMORY.md                    # 索引（插件维护，唯一入口）
 │   ├── memory/                      # 记忆正文
@@ -377,11 +555,18 @@ node D:/workspaces/ai/dsh-memory-md/test/run.mjs
 > 安全保证：只搬带**已知 `type:`** frontmatter 的真记忆（别的文件一律不动），
 > 目标已存在则**跳过并报告，绝不覆盖**，只 `rename` 不改内容。跑前建议先备份。
 
-`{slug}` 由工作区绝对路径压缩而来（盘符与分隔符转 `-`、全小写）：
+`{slug}` 由工作区绝对路径压缩而来（盘符与分隔符转 `-`、全小写，**中文原样保留**）：
 
 ```
 D:\workspaces\ai\dsh-memory-md  →  d-workspaces-ai-dsh-memory-md
+D:\坚果云工作日志                →  d-坚果云工作日志
 ```
+
+> **中文路径**：早先版本把非 ASCII 字符整体当分隔符抹掉，`D:\测试中文路径` 与
+> `D:\坚果云工作日志` 都会塌缩成同一个 `d`，于是所有中文项目共用一份项目级记忆。
+> 现已改为只对 ASCII 部分做折叠 —— ASCII 路径的输出与旧版**完全一致**（无需迁移），
+> 但**旧的 `d/` 目录不会自动改名**：里面的记忆要按项目路径手工归位到新的
+> `d-<中文>` 目录，迁移步骤见 `FIX-CJK-SLUG.md` 的第七节。
 
 ---
 
@@ -415,6 +600,7 @@ type: reference
 | 工作留痕 | 关 | 是否允许写日志（只写不读）。后台总结与 `memory_md_journal` 都受它控制 |
 | 触发轮数 | 2 | 累积够这么多轮就跑一次后台总结。与「触发字符数」**任一达标即触发** |
 | 触发字符数 | 2000 | 这一段新增内容够长也触发一次。单条很长（如一次长分析）时不必等够轮数 |
+| 体检后交模型复核 | 开 | `/memory-check` 跑完后，把「可能过期/可能有误」的条目投回主模型，让它用 read/grep 核实。关掉则只出报告，不额外起一轮对话 |
 | 在这些预设下停用 | 空 | 一行一个 preset id，支持 `*` 通配（如 `presetmd-*`）。这些预设里的对话不读也不写全局记忆 |
 
 > 两个阈值**清空即用默认值**（服务端归一化兜底）；填非正数也回落默认，
@@ -474,6 +660,9 @@ node test/run.mjs    # 跑全部 15 个测试套件
 | `preset-exclude` | 预设停用名单：读写日志全拦 |
 | `regression-kind` | 从真实会话日志取证：缺 source 会崩回合 |
 | `schema` | 工具 schema 过 DSH **真实的** `assertSupportedJsonSchema` |
+| `layout` | 目录布局：索引在作用域根、正文在 `memory/`、写入落位与防撞车 |
+| `render` | 设置页组件真实渲染一遍（源码文本检查测不出渲染路径的错） |
+| `salvage` | 总结输出超限被截断时的括号配平与数组元素抢救 |
 | `tools` | 工具行为：写入位置、索引维护、越界拒绝 |
 
 ### 代码结构
@@ -484,6 +673,7 @@ node test/run.mjs    # 跑全部 15 个测试套件
 | `src/tools.mjs` | 五个记忆工具的实现与说明书 |
 | `src/inject.mjs` | 注入：`MEMORY_PROTOCOL`（提示词段）+ `renderMemoryIndex`（快照） |
 | `src/summarize.mjs` | 轮末后台总结：独立 LLM 调用，写记忆与日志 |
+| `src/checkup.mjs` | `/memory-check` 全库体检：规则体检 + LLM 语义分析 + 报告（只读） |
 | `src/schema.mjs` | schema 转换（不用 `defineTool`，见下） |
 | `src/routes.mjs` | HTTP 接口 `/memory-md/api/*` |
 | `src/settings.mjs` | 设置读写 |

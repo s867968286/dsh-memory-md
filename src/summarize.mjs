@@ -47,6 +47,7 @@ import {
   normalizeMemoryFile,
   resolveMemoryFile,
   timeStamp,
+  writeDiagnosticDump,
   writeMemory,
 } from './store.mjs'
 
@@ -390,13 +391,26 @@ export const SUMMARY_SYSTEM = [
   '同样要精简：**大多数轮次没有值得长期保留的东西，返回空数组是正常的**，',
   '不要为了"有产出"而凑记忆。',
   '',
+  '⚠️ `name` 只写**标题本身**：不要带 type 前缀（不要写 `feedback_xxx`），',
+  '也不要带 `.md` 后缀 —— 前缀与扩展名由插件自己加。',
+  '写成 `feedback_xxx.md` 会派生出 `feedback_feedback_xxx_md.md` 这种文件名，',
+  '并且让同一件事变成两条互相看不见的记忆。',
+  '',
   '⚠️ **消息末尾会附一份「已有的记忆」清单**（如果记忆库非空）。**写之前先看它**：',
   '清单里已经有同一件事的条目 → 把那一行的**文件名**填进 `file` 字段覆盖更新，',
   '而不是新写一条。清单为空或没有相关的 → 才新写（新写时**省略 `file`**）。',
   '这是避免写出重复记忆的唯一依据 ——',
   '你**看不到**这些记忆的正文，只能看到文件名与描述。',
-  '⚠️ `file` 只填**文件名本身**（如 `feedback_testing.md`），**不要带目录前缀** ——',
-  '写 `memory/feedback_testing.md` 会导致另存成一条新记忆，正是我们要避免的重复。',
+  '',
+  '🚨 **`file` 填错会毁掉一条记忆，必须严格执行**：',
+  '- 每一行清单都带作用域前缀：`[global]` 或 `[project]`。',
+  '  **只能抄和你这次要写的那条同一个作用域的行** —— 你要写 `scope: "project"`，',
+  '  就只准从 `[project]` 行里挑；写 `global` 就只准从 `[global]` 行里挑。',
+  '- **只有当描述说的确实是同一件事**时才填 `file`。只是"名字沾边"、"主题相近"',
+  '  不算 —— **拿不准就省略 `file`**，宁可多一条能在索引里看见的重复，',
+  '  也不要顶掉一条你看不见正文的记忆。',
+  '- `file` 只填**文件名本身**（如 `feedback_testing.md`），**不要带目录前缀**：',
+  '  写 `memory/feedback_testing.md` 会另存成一条新记忆，正是我们要避免的重复。',
   '注意：这段对话里可能出现的 `<memory-index>` 块也是**已有记忆的索引**，',
   '不是用户说过的话 —— 不要因为在那里见过某个说法就再存一条。',
   '拿不准某件事是不是已经记过了，就**不要写** —— 宁可漏记，也不要重复记。',
@@ -501,16 +515,44 @@ async function runSummary({ llm, route, transcript, existingMemories, signal, lo
   // `max-tokens` 就是**输出被上限截断**的明确信号 —— 有了它就不必靠"猜 JSON 为什么坏"，
   // 可以直接走抢救路径，并在日志里说清原因。
   let truncated = false
+  // 除了 `max-tokens`，另两种终态也要留下：`error` / `aborted` 意味着这次调用
+  // 根本没跑完，输出为空或半截 —— 与"模型输出了坏 JSON"是**完全不同**的故障，
+  // 只看"无法解析"会把两者混为一谈。
+  //
+  // ⚠️ 光记 `kind` **不够**：官方契约里 `error` / `aborted` 的 finish reason
+  // **必带 `failure`**（`dsh-llm/lib/types/types.d.ts` 的 `FinishReasonMap`：
+  // `{ kind: 'error', failure: LlmFailure }`），里面有 `message` / `code` /
+  // `status` / `requestId` —— 那才是"为什么失败"的答案。
+  //
+  // 真实教训（2026-10-12）：第一版埋点只记了 `finish error`，于是诊断文件里
+  // 写着「终态 error、原文 0 字符」，却**说不出是限流、超时还是鉴权失败**，
+  // 排查到这一步又卡住。官方 `dsh-session-title-llm` 的 `finishError()` 在
+  // `error`/`aborted` 时直接 `throw new Error(failure.message)` 并挂上
+  // `code`（lib/index.js:161-174）—— 它不吞这个信息，我们也不该吞。
+  let finishKind
+  let failure
   for await (const chunk of llm.stream({
     provider: route.provider,
     model: route.model,
+    // ⚠️ **必须带上**，否则 pi-ai 会回落到 profile 级 reasoning
+    // （`dsh-llm-pi-ai/lib/index.js:1847`：`options.reasoningEffort ?? profile.reasoning`），
+    // 用的就不是主对话那个级别了 —— 真实事故里这直接导致上游 400／code 11150。
+    // `route` 已从 `requestHeader().config` 照抄了该字段（见调用点的说明）。
+    ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+    ...(route.temperature === undefined ? {} : { temperature: route.temperature }),
     messages,
     system: SUMMARY_SYSTEM,
     maxTokens: MAX_OUTPUT_TOKENS,
     signal,
   })) {
     if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
-    else if (chunk?.type === 'finish' && chunk.reason?.kind === 'max-tokens') truncated = true
+    else if (chunk?.type === 'finish') {
+      finishKind = chunk.reason?.kind
+      if (chunk.reason?.kind === 'max-tokens') truncated = true
+      else if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+        failure = chunk.reason.failure
+      }
+    }
   }
 
   if (truncated) {
@@ -518,7 +560,15 @@ async function runSummary({ llm, route, transcript, existingMemories, signal, lo
       `[memory-md] 总结输出撞上 maxTokens=${MAX_OUTPUT_TOKENS} 被截断，尝试抢救已完成部分`,
     )
   }
-  return parseSummary(text, logger)
+  // 把原文与终态一并交回调用方：解析失败时要靠它们写诊断转储。
+  // 这里**不再只返回解析结果** —— 那样原文就丢了，正是排查卡住的原因。
+  return {
+    result: parseSummary(text, logger),
+    raw: text,
+    truncated,
+    finishKind,
+    failure,
+  }
 }
 
 /**
@@ -684,8 +734,63 @@ export function parseSummary(raw, logger) {
   }
 
   // ---- 第三层：确实什么都拿不到 ----
-  logger?.warn?.('[memory-md] 总结输出无法解析，已跳过')
+  //
+  // ⚠️ 这里**只报"拿不到"，不猜原因**。早先这句写的是
+  // 「总结输出无法解析（JSON 不完整或格式错误）」—— 括号里那句是**凭空的因果
+  // 断言**：调用可能压根没产出任何内容（finish error / 被中止 / 模型只出了推理），
+  // 那时根本不存在"JSON"。真实事故（2026-10-12）里 93 行日志全是这句，
+  // 它把人一路带向"调大 maxTokens / 改解析器"，而真因是调用失败。
+  // 分类与措辞交给 `classifyParseFailure()`，那里能看到 finish 终态。
+  logger?.warn?.('[memory-md] 总结输出未取得可解析内容，已跳过')
   return undefined
+}
+
+/**
+ * 把「解析拿不到结果」**按实情**分类。
+ *
+ * ## 为什么必须分类，而不是一句"无法解析"
+ *
+ * `parseSummary` 返回 undefined 只是说"没拿到东西"，它对**为什么**一无所知：
+ * 调用可能失败了、可能被截断、可能输出为空、也可能是真的格式错。这四种的排查
+ * 方向与修法完全不同。早先把它们统一写成「JSON 不完整或格式错误」，于是：
+ *
+ *   - 真因是调用失败时，那句话会把人引向"调大 `MAX_OUTPUT_TOKENS`"死路
+ *     （真实事故 2026-10-12：93 行日志、排查绕了两轮）；
+ *   - 光看日志**无法区分**这四种，因为没有一行记录了 finish 终态与原文长度。
+ *
+ * 判定顺序有意为之：**调用失败优先**。因为 `error`/`aborted` 时必然没有完整
+ * 输出，若先判"输出为空"或"无法解析"，就会把调用失败降格成格式问题 ——
+ * 那正是原来的毛病。
+ *
+ * @returns `{ slug, label }`：`slug` 进诊断文件名（便于按类型筛文件名），
+ *   `label` 是给人读的一句话。
+ */
+export function classifyParseFailure({ raw, truncated, finishKind, failure }) {
+  // ① 调用失败 / 被中止：一个字都不该有，先认这个。
+  if (failure !== undefined || finishKind === 'error' || finishKind === 'aborted') {
+    const aborted = finishKind === 'aborted'
+    return {
+      slug: 'summary-call-failed',
+      label: aborted ? '总结调用被中止（未产出内容）' : '总结调用失败（未产出内容）',
+    }
+  }
+  // ② 撞输出上限：有内容但不完整，且抢救也没捞到完整条目。
+  if (truncated) {
+    return {
+      slug: 'summary-truncated',
+      label: '总结输出撞上 maxTokens 被截断，且未抢救出任何完整条目',
+    }
+  }
+  // ③ 调用正常结束，但模型没给正文。注意这与 ① 不同：`stop` 但空输出是
+  //    **模型行为**（可能只出了推理），不是链路故障。
+  if (String(raw ?? '').trim() === '') {
+    return { slug: 'summary-empty-output', label: '总结输出为空（调用正常结束但无正文）' }
+  }
+  // ④ 确实有内容、确实不是合法 JSON —— 只有这一种才配得上"格式错误"的措辞。
+  return {
+    slug: 'summary-unparsable',
+    label: '总结输出无法解析（有内容但不是合法 JSON）',
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -783,6 +888,10 @@ export function createTurnStoppingListener({
   // 记忆根目录的解析基准。由 Host 半传 config.dshHome —— 与 tools/routes 同源，
   // 否则后台总结会写到与工具不同的目录（见 run() 内的说明）。
   dshHome,
+  // 取 preset id。**由 Host 半注入**：`presetOf()` 住在 `index.js`，它要折叠
+  // 会话事件流（`agent-preset/selected`）再回落 header，逻辑不小且已有单一实现；
+  // 在这里重写一份迟早与停用判据漂移。只用于诊断输出，取不到就是 undefined。
+  presetOf,
   // 可注入仅为测试：生产用默认值。见 SUMMARY_TIMEOUT_MS 的说明。
   summaryTimeoutMs = SUMMARY_TIMEOUT_MS,
   // 同上。
@@ -877,7 +986,9 @@ export function createTurnStoppingListener({
       // 都不足 → **不推进游标**，留给下一轮回补（短回合不再造成永久空洞）；
       // 但 force 路径（会话结束/压缩前）不受此限 —— 那是最后的机会。
       const messageCount = messages.length
-      const charCount = pending.length === 0 ? 0 : renderTranscript(pending).length
+      // 转写只算一次：下面真正发总结用的是同一段（同参数），曾经算两遍。
+      const transcript = renderTranscript(pending)
+      const charCount = transcript.length
       const enough = messageCount >= minReviewTurns || charCount >= minReviewChars
       if (!enough && !force) return
 
@@ -894,14 +1005,39 @@ export function createTurnStoppingListener({
         return
       }
 
-      const transcript = renderTranscript(pending)
       if (!transcript.trim()) return
 
       // 路由：优先用本会话最近一次真实请求的 provider/model。
+      //
+      // ⚠️ **必须连同 `reasoningEffort` 一起取**，不能只取 provider/model。
+      // 请求头里的 config 是官方 `LlmCallConfig`（`dsh-llm/lib/types/call-config.d.ts`），
+      // 除 provider/model 外还带 `reasoningEffort` / `temperature` / `maxTokens` / `stop`，
+      // 且**逐字段 1:1 映射**到 `GenerateOptions` —— 官方 loop 就是照这份 header
+      // 构造请求的（该文件顶部注释：*"the loop builds requests from the logged
+      // header rather than accepting these per call"*）。
+      //
+      // 只取两个字段的后果不是"少传一个可选参数"，而是**静默换了来源**：
+      // pi-ai 对 undefined 的 `reasoningEffort` 会回落到 **profile 级**的
+      // （`dsh-llm-pi-ai/lib/index.js:1847`：`options.reasoningEffort ?? profile.reasoning`），
+      // 于是后台调用用的级别与主对话不是同一个。真实事故（2026-10-12）：
+      // 主对话显式传 `high` 一直正常，而后台调用回落到 profile 的值，
+      // 被上游拒绝 —— 400 / code 11150
+      // 「the reasoning effort value is not supported by the current model」。
+      //
+      // 主对话**能跑通**这件事本身就是最强的证据：照抄它的参数不会更差。
       const header = session?.requestHeader?.()
       const fallback = typeof defaultRoute === 'function' ? defaultRoute() : defaultRoute
-      const route = header?.config?.provider && header?.config?.model
-        ? { provider: header.config.provider, model: header.config.model }
+      const config = header?.config
+      const route = config?.provider && config?.model
+        ? {
+            provider: config.provider,
+            model: config.model,
+            // 逐个可选字段照搬 —— 有就带、没就不带，不自己编造默认值。
+            ...(typeof config.reasoningEffort === 'string' && config.reasoningEffort
+              ? { reasoningEffort: config.reasoningEffort } : {}),
+            ...(typeof config.temperature === 'number' ? { temperature: config.temperature } : {}),
+            ...(typeof config.stop !== 'undefined' ? { stop: config.stop } : {}),
+          }
         : fallback
       // 拿不到路由 → 不推进游标，下一轮重试。
       if (route === undefined || !route.provider || !route.model) {
@@ -919,6 +1055,33 @@ export function createTurnStoppingListener({
       state.running = true
       state.runningSince = Date.now()
 
+      // ---- 诊断上下文：失败时随原文一起落盘 ----
+      //
+      // 为什么在这里算好而不是失败时现取：`runSummary` 是 await 出去的，
+      // 回来时 `agent` / `session` 可能已经随会话销毁而取不到了（`agent/disposed`
+      // 之后正是这种时序）。而"哪个会话、哪个模型、第几轮"恰恰是排查的第一入口。
+      const sessionId = typeof session?.id === 'string' ? session.id : undefined
+      const presetId = typeof presetOf === 'function' ? presetOf(session) : undefined
+      const diagContext = [
+        `时间        ${new Date().toISOString()}`,
+        `会话        ${sessionId ?? '(未知)'}`,
+        `工作区      ${cwd ?? '(未知)'}`,
+        `preset      ${presetId ?? '(未知)'}`,
+        `轮次        ${fromTurn}→${turn}`,
+        // 合并写一行（而不是只留下面拆开的两行）：诊断目录里要按模型横向
+        // 统计"哪个模型老失败"时，分开的行 grep 不到 `provider/model` 这个串。
+        // 与 error.log 里的写法保持一致，两处可以直接对着看。
+        `路由        ${route.provider}/${route.model}`,
+        `provider    ${route.provider}`,
+        `model       ${route.model}`,
+        // 排查 400「reasoning effort 不被支持」时这条是**第一现场**：
+        // 它同时说明了"用了哪个级别"与"级别是从哪来的"（照抄主对话 vs 回落）。
+        `思考级别    ${route.reasoningEffort ?? '(未指定 → 由适配器回落 profile 值)'}`,
+        `maxTokens   ${MAX_OUTPUT_TOKENS}（插件硬编码上限）`,
+        `转写字符数  ${transcript.length}`,
+        `已有记忆清单字符数 ${existingMemories.length}`,
+      ].join('\n')
+
       // 后台跑：立刻返回，不阻塞轮次收尾。
       void (async () => {
         let ok = false
@@ -929,7 +1092,9 @@ export function createTurnStoppingListener({
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(new Error('summary timeout')), summaryTimeoutMs)
         try {
-          const result = await runSummary({ llm, route, transcript, existingMemories, logger, signal: controller.signal })
+          const { result, raw, truncated, finishKind, failure } = await runSummary({
+            llm, route, transcript, existingMemories, logger, signal: controller.signal,
+          })
           if (result !== undefined) {
             if (result.notes.length > 0 || result.memories.length > 0) {
               const written = persistSummary({
@@ -946,9 +1111,47 @@ export function createTurnStoppingListener({
             // 解析成功（哪怕是空数组）就算处理过这一段。
             ok = true
           } else {
+            // ⚠️ 措辞必须**按实情分类**，不能写死一句因果断言。
+            //
+            // 早先这里无条件写「总结输出无法解析（JSON 不完整或格式错误）」，
+            // 而括号里那句是凭空断言的因果 —— 实测最常见的其实是**调用失败**
+            // （finish error、原文 0 字符），那时压根不存在 JSON，更没有"格式"。
+            // 这句话把排查引向了"调大 MAX_OUTPUT_TOKENS"的死路。
+            //
+            // `failure` 是 `error`/`aborted` 终态里的官方失败详情
+            // （`{ message, code, status, providerRetryAfterMs, requestId }`），
+            // 必记：光知道"调用没成"分不清限流 / 超时 / 鉴权。
+            const kind = classifyParseFailure({ raw, truncated, finishKind, failure })
+            const failureLine = failure === undefined
+              ? ''
+              : `\n失败详情   code=${failure.code ?? '(无)'}` +
+                `\n           message=${failure.message ?? '(无)'}` +
+                (failure.status !== undefined ? `\n           status=${failure.status}` : '') +
+                (failure.providerRetryAfterMs !== undefined
+                  ? `\n           retryAfter=${failure.providerRetryAfterMs}ms` : '') +
+                (failure.requestId !== undefined ? `\n           requestId=${failure.requestId}` : '')
+            const dump = writeDiagnosticDump(paths.diagnosticsDir, {
+              sessionId,
+              summary: kind.slug,
+              context: `${diagContext}\n判定       ${kind.label}` +
+                `\nfinish 终态 ${finishKind ?? '(未收到 finish chunk)'}` +
+                `${failureLine}\n` +
+                `截断标记   ${truncated ? '是（撞上 maxTokens）' : '否'}\n` +
+                `原文长度   ${raw.length} 字符`,
+              raw,
+            })
             appendErrorLog(
               paths.errorLogFile,
-              `轮 ${fromTurn}→${turn} 总结输出无法解析（JSON 不完整或格式错误），下轮重试`,
+              `轮 ${fromTurn}→${turn} ${kind.label}，下轮重试` +
+              `｜模型 ${route.provider}/${route.model}｜会话 ${sessionId ?? '未知'}` +
+              `｜finish ${finishKind ?? '无'}｜截断 ${truncated ? '是' : '否'}｜原文 ${raw.length} 字符` +
+              // 失败详情进 error.log 的那一行也要带上 —— 它才是人工第一眼看的地方，
+              // 让人为了看一个 code 还得去开诊断文件是说不过去的。
+              (failure !== undefined
+                ? `｜失败 ${failure.code ?? '?'}: ${String(failure.message ?? '').slice(0, 200)}` +
+                  (failure.status !== undefined ? `（HTTP ${failure.status}）` : '')
+                : '') +
+              (dump !== undefined ? `｜诊断 ${dump}` : '｜诊断转储失败'),
             )
           }
         } catch (error) {
@@ -956,7 +1159,13 @@ export function createTurnStoppingListener({
           logger?.warn?.(`[memory-md] 后台总结失败（下轮重试）: ${detail}`)
           // 详细错误写独立错误日志（与 settings.json 同层），**不写进 .journal**
           // —— 日记是"今天做了什么"的叙事，塞错误会污染它。
-          appendErrorLog(paths.errorLogFile, `轮 ${fromTurn}→${turn} 总结失败：${detail}（下轮重试）`)
+          // 抛错路径没有模型输出可存，但会话/模型/轮次同样要记 —— 否则事后
+          // 分不清"是 provider 挂了"还是"模型输出了坏 JSON"。
+          appendErrorLog(
+            paths.errorLogFile,
+            `轮 ${fromTurn}→${turn} 总结失败：${detail}（下轮重试）` +
+            `｜模型 ${route.provider}/${route.model}｜会话 ${sessionId ?? '未知'}`,
+          )
         } finally {
           clearTimeout(timer)
           // 失败时**保留游标**，下一轮自动回补这段内容。

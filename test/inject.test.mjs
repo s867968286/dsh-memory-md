@@ -8,7 +8,9 @@
  *      也就不会产生任何历史消息；
  *   4. 索引用 `<memory-index scope="…">` 标签裹住，边界与作用域对模型明确；
  *   5. 索引超限时截断（`truncateEntrypointContent`，200 行 / 4e4 字符）；
- *   6. **行为纪律（`MEMORY_RULES`）与索引同走快照** —— 但只在真有索引时才注入。
+ *   6. **行为纪律（`MEMORY_RULES`）走 `systemPrompt.section()`** —— 它是常量，
+ *      不进快照；曾与索引同走快照，索引一变就带着整段重发（README 有同一漂移
+ *      的修正记录）。
  *
  * 协议（`MEMORY_PROTOCOL`）不在快照里 —— 它走 `systemPrompt.section()`
  * （系统提示词段），由 `load.test.mjs` 验证注册。这里只验证它不含易变内容。

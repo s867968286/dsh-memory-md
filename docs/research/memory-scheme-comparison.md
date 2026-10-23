@@ -122,7 +122,7 @@ Use narrow search terms rather than broad keywords.
   只注入索引，不注入正文；每次装配重读，热更新
 ```
 
-> 定案细节见 `docs/plan.md`。原「改名 AGENTS.md / 复用其他插件」路线已否决。
+> 定案细节见 `docs/design/plan.md`。原「改名 AGENTS.md / 复用其他插件」路线已否决。
 
 ### 现成插件评估结论
 
@@ -150,8 +150,8 @@ Use narrow search terms rather than broad keywords.
 
 | 内容 | 路径 |
 |---|---|
-| WorkBuddy 详细分析 | `docs/memory-scheme-workbuddy.md` |
-| CodeBuddy 详细分析 | `docs/memory-scheme-codebuddy.md` |
+| WorkBuddy 详细分析 | `docs/research/memory-scheme-workbuddy.md` |
+| CodeBuddy 详细分析 | `docs/research/memory-scheme-codebuddy.md` |
 | WorkBuddy 提示词模板 | `~/.workbuddy/plugins/marketplaces/workbuddy-builtin/prompt-common/fragments/` |
 | WorkBuddy 源码 | `C:\Users\kosei\Desktop\1\app-extracted\main\workbuddy-auth-product-coordinator.js` |
 | CodeBuddy 源码 | `D:\soft\node\node-v22.23.2\node_modules\@tencent-ai\codebuddy-code\dist\codebuddy.js` |

@@ -157,12 +157,111 @@ try {
   console.log('\n读取与搜索')
   const read = registered.get(TOOL_READ)
   const listing = await read.execute({ scope: 'all' }, exec)
-  check('列出一条记忆', listing.entries.length, 1)
-  check('条目带 type', listing.entries[0].type, 'reference')
-  check('条目带 name', listing.entries[0].name, '数据库端口')
+  check('列出一条记忆 + 索引条目', listing.entries.length, 2)
+  check('列表含索引条目', listing.entries.some((e) => e.file === 'MEMORY.md'), true)
+  const bodyEntry = listing.entries.find((e) => e.file !== 'MEMORY.md')
+  check('条目带 type', bodyEntry.type, 'reference')
+  check('条目带 name', bodyEntry.name, '数据库端口')
+  check(
+    '索引条目说明可传给 file',
+    listing.entries.find((e) => e.file === 'MEMORY.md').description.includes('file'),
+    true,
+  )
 
   const full = await read.execute({ scope: 'project', file: result.file }, exec)
   check('可按文件名读全文', full.text.includes('更新后的正文'), true)
+
+  console.log('\n列表条目必须带 scope（回归：indexEntryFor 漏回填导致 output 校验失败）')
+  {
+    // 早先 indexEntryFor(dir) 返回的索引条目没有 scope，而 read 的输出 schema
+    // 把 scope 标成 required —— 于是 `scope=all`（默认值）一调就整块报
+    //   invalid output: missing required property "value.entries[0].scope"
+    // 下标 0 恰好总是 global 索引，等于默认路径必炸。
+    check(
+      '每条列表条目都有 scope',
+      listing.entries.every((e) => typeof e.scope === 'string' && e.scope !== ''),
+      true,
+    )
+    check(
+      '索引条目带正确 scope',
+      listing.entries.find((e) => e.file === 'MEMORY.md').scope,
+      'project',
+    )
+    // 渲染同样依赖它：缺字段时列表会打出 "undefined/MEMORY.md"。
+    const rendered = read.output.render({ scope: 'all' }, listing)[0].text
+    check('渲染里不出现 undefined', rendered.includes('undefined'), false)
+  }
+
+  console.log('\n作用域不符时的报错要说清作用域与类型（回归：曾报"没有这条记忆"）')
+  {
+    // 复刻踩坑现场：一条 type=project 的记忆住在 global，调用方按文件名前缀
+    // 误传 scope=project。原文案「没有这条记忆」把它说成"不存在"，模型于是
+    // 去怀疑文件名而不是作用域。
+    const g = await save.execute(
+      {
+        scope: 'global',
+        type: 'project',
+        name: '全局里的项目类记忆',
+        description: 'type 是 project，但住在 global',
+        content: '这条用来验证 scope 与 type 正交。',
+      },
+      exec,
+    )
+    check('global 里写入了一条 type=project 的记忆', g.created, true)
+
+    let message = ''
+    try {
+      await read.execute({ scope: 'project', file: g.file }, exec)
+    } catch (e) {
+      message = e.message
+    }
+    check('作用域不符时确实报错', message.length > 0, true)
+    check('报错点明没有的只是所选作用域', message.includes('作用域 project'), true)
+    check('报错指出它实际在 global', message.includes('global'), true)
+    check('报错给出可用的调用方式', message.includes('scope="global"'), true)
+    check('报错不把 scope 与 type 混为一谈', message.includes('与文件名前缀无关'), true)
+
+    // 反过来：作用域对了一读就到 —— 证明不是记忆丢了。
+    const ok = await read.execute({ scope: 'global', file: g.file }, exec)
+    check('按正确作用域能读到', ok.text.includes('scope 与 type 正交'), true)
+
+    // 彻底不存在时，报错要把 scope/type 的正交关系讲清楚。
+    let missMessage = ''
+    try {
+      await read.execute({ scope: 'all', file: 'reference_根本不存在的记忆.md' }, exec)
+    } catch (e) {
+      missMessage = e.message
+    }
+    check('不存在时也报错', missMessage.length > 0, true)
+    check('报错区分 scope 与 type', missMessage.includes('两回事'), true)
+    check('报错建议先查列表', missMessage.includes('列表模式'), true)
+
+    await registered.get(TOOL_FORGET).execute({ scope: 'global', file: g.file }, exec)
+  }
+
+  console.log('\nMEMORY.md 索引可读（E1 回归：目录收进 memory/ 后契约断裂）')
+  {
+    // description 承诺 file 可传 "MEMORY.md" 读索引全文 —— 索引在作用域根，
+    // 曾被 memoryFilePath() 拼进 memory/ 子目录而永远读不到（布局改造的回归）。
+    const idx = await read.execute({ scope: 'project', file: 'MEMORY.md' }, exec)
+    check('读到索引全文', idx.text?.includes('[数据库端口]'), true)
+    check('索引读取不返回条目', idx.entries, [])
+    // 索引由插件独占维护：把它当正文的写入与删除都必须被拒，
+    // 否则 memory/ 里会多出同名正文与一条指向它的索引死链。
+    check(
+      'save 拒绝把 MEMORY.md 当正文写',
+      await throwsSync(() => save.execute(
+        { scope: 'project', type: 'user', name: 'x', description: 'y', content: 'z', file: 'MEMORY.md' },
+        exec,
+      )),
+      true,
+    )
+    check(
+      'forget 拒绝删索引',
+      await throwsSync(() => registered.get(TOOL_FORGET).execute({ scope: 'project', file: 'MEMORY.md' }, exec)),
+      true,
+    )
+  }
 
   const search = registered.get(TOOL_SEARCH)
   const hit = await search.execute({ query: '5433', scope: 'all' }, exec)

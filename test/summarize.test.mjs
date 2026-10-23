@@ -71,7 +71,7 @@ const REPLY = JSON.stringify({
  * 这条路径是为真实事故加的（见 summarize.mjs 的 max-tokens 观测），
  * 早先零测试覆盖 —— 只加观测代码不加测试，下次没人知道它还在不在工作。
  */
-function makeLlm({ reply = REPLY, fail = false, hang = false, truncate = false } = {}) {
+function makeLlm({ reply = REPLY, fail = false, hang = false, truncate = false, finishError = false } = {}) {
   return {
     stream(options) {
       llmCalls.push(options)
@@ -87,6 +87,27 @@ function makeLlm({ reply = REPLY, fail = false, hang = false, truncate = false }
             }, { once: true })
             // 兜底：没有 signal 就永远挂着（测试会因此超时失败，正是我们要防的）
           })
+          return
+        }
+        if (finishError) {
+          // ⭐ 真实拿到的现场（2026-10-12）：**一个字都没产出**，finish 终态是
+          // `error` 且带官方 `failure` 详情。这不是"JSON 坏"，是调用本身失败 ——
+          // 两者在旧日志里都只写「无法解析」，完全分不开。
+          // 官方契约（`dsh-llm/lib/types/types.d.ts` 的 FinishReasonMap）：
+          //   { kind: 'error', failure: LlmFailure }
+          // LlmFailure = { message, code, status?, providerRetryAfterMs?, requestId? }
+          yield {
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: {
+                message: 'upstream is momentarily unavailable',
+                code: 'PROVIDER_UNAVAILABLE',
+                status: 503,
+                providerRetryAfterMs: 2000,
+              },
+            },
+          }
           return
         }
         if (truncate) {
@@ -105,12 +126,28 @@ function makeLlm({ reply = REPLY, fail = false, hang = false, truncate = false }
   }
 }
 
-/** 假 session：header + ownEvents + requestHeader。 */
-function makeSession(events, agentPreset = 'standard') {
+/**
+ * 假 session：header + ownEvents + requestHeader。
+ *
+ * `config` 默认**带 `reasoningEffort`** —— 真实请求头就是这个形状
+ * （实测：`{"provider":"workbuddy","model":"deepseek-v4.1-flash","reasoningEffort":"high"}`，
+ * 官方类型为 `LlmCallConfig`）。夹具若省掉它，后台调用"照抄主对话参数"那条
+ * 路径就永远走不到，等于零覆盖。
+ */
+function makeSession(events, agentPreset = 'standard', config = undefined) {
   return {
+    // 真实会话有 `id`（诊断转储要拿它当文件名前缀与来源标识），夹具必须有，
+    // 否则那条路径在测试里永远走的是 `(未知)` 分支。
+    id: 'sess-fixture-0001',
     header: { cwd: CWD, agentPreset },
     ownEvents: () => events,
-    requestHeader: () => ({ config: { provider: 'workbuddy', model: 'deepseek-v4.1-flash' } }),
+    requestHeader: () => ({
+      config: config ?? {
+        provider: 'workbuddy',
+        model: 'deepseek-v4.1-flash',
+        reasoningEffort: 'high',
+      },
+    }),
   }
 }
 
@@ -568,6 +605,270 @@ try {
     llm = makeLlm()  // 还原给后续用例
   }
 
+  // ⭐ 回归：**解析失败必须留下可排查的现场**（2026-10-12）。
+  //
+  // 背景：`error.log` 里堆了 93 行「总结输出无法解析（JSON 不完整或格式错误）」，
+  // 但**没有一行能回答"坏在哪里"** —— 这个措辞背后至少有四种互斥成因
+  // （撞 maxTokens 截断 / 压根没输出 JSON / 多段 JSON / 字符串里有裸换行），
+  // 修法完全不同。原因就是只记了一句结论、没记模型原文与调用上下文。
+  //
+  // 这条测试同时盯着三件事，缺一不可：
+  //   1. 原文**逐字节**落盘（否则还是只能猜）；
+  //   2. 上下文含会话 id / 模型 / 轮号 / finish 终态（定位是哪一次调用）；
+  //   3. error.log 那一行也要带上同样的上下文（它才是人工第一眼看的入口）。
+  console.log('\n回归：解析失败落盘诊断现场')
+  {
+    resetForTest()
+    llmCalls.length = 0
+    const DIAG_DIR = join(paths.memoryRoot, 'diagnostics')
+    rmSync(DIAG_DIR, { recursive: true, force: true })
+
+    // 模型回了一段自然语言（**不是** JSON）—— 这正是"无法解析"最容易被误判成
+    // "输出被截断"的那种情况：修法应该是改提示词，而不是调 maxTokens。
+    const NONSENSE = '我复盘了一下这一轮，主要做了三件事，但没有写成 JSON。'
+    llm = makeLlm({ reply: NONSENSE })
+    const sDiag = makeSession(turnEvents(7))
+    const lDiag = createTurnStoppingListener({
+      getLlm: () => llm,
+      getSession: () => sDiag,
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+      presetOf: () => 'standard-gitbash',
+    })
+    lDiag({ agent, turn: 7 })
+    await settle()
+
+    const files = existsSync(DIAG_DIR) ? readdirSync(DIAG_DIR) : []
+    check('生成了诊断文件', files.length, 1)
+    const dump = files.length > 0 ? readFileSync(join(DIAG_DIR, files[0]), 'utf8') : ''
+
+    // ① 原文逐字节在位（这是全部意义所在）
+    check('诊断含模型原始输出', dump.includes(NONSENSE), true)
+    check('原文写在独立小节里', dump.includes('===== 模型原始输出（逐字节） ====='), true)
+    // ② 上下文足以定位到具体某次调用
+    check('含会话 id', dump.includes('sess-fixture-0001'), true)
+    check('含模型', dump.includes('workbuddy/deepseek-v4.1-flash'), true)
+    // ⚠️ 轮次是 `fromTurn→turn`，而**首次见到一个会话时游标锚定在 `turn-1`**
+    //    （见 summarize.mjs 的 isFirstSight 说明：锚 0 会把整个历史重跑一遍）。
+    //    所以第 7 轮首次触发写的是 `6→7`，不是 `7→7` —— 断言写错会掩盖真实语义。
+    check('含轮次', dump.includes('6→7'), true)
+    check('含 preset', dump.includes('standard-gitbash'), true)
+    check('含 finish 终态', dump.includes('finish 终态 stop'), true)
+    check('明确未截断', dump.includes('截断标记   否'), true)
+    // ③ 文件名带时间戳与会话前缀，便于人工按图索骥。
+    //    取会话 id 前 8 字符 —— 真实 id 含连字符，所以不能按 `\w{8}` 断言。
+    const shortId = 'sess-fixture-0001'.slice(0, 8)
+    check('文件名含会话前缀', files[0]?.includes(`-${shortId}-`) === true, true)
+    check('文件名以失败类型结尾', files[0]?.endsWith('-summary-unparsable.txt') === true, true)
+
+    // error.log 那一行也必须能独立定位（它才是第一眼看的入口）
+    //
+    // ⚠️ **不要用措辞定位**（`includes('总结输出无法解析')`）：那句措辞本身就是
+    // 本次要改掉的东西，用它当锚点会让"改对措辞"反而把测试弄红 —— 断言不该
+    // 绑在会变的文案上。用行里**结构性**的字段（`｜诊断 ` / `｜模型 `）定位。
+    const errLog = readFileSync(paths.errorLogFile, 'utf8')
+    const line = errLog.split('\n').filter((l) => l.includes('｜诊断 ') && l.includes('｜模型 ')).pop() ?? ''
+    check('error.log 含模型', line.includes('workbuddy/deepseek-v4.1-flash'), true)
+    check('error.log 含会话', line.includes('sess-fixture-0001'), true)
+    check('error.log 含 finish 终态', line.includes('finish stop'), true)
+    check('error.log 指向诊断文件', line.includes(files[0] ?? '\u0000'), true)
+
+    // 失败仍要保留游标（诊断不能改变既有的重试语义）
+    llmCalls.length = 0
+    llm = makeLlm()
+    lDiag({ agent, turn: 8 })
+    await settle()
+    check('解析失败后下一轮仍重试同一段', llmCalls.length, 1)
+
+    // 反证：诊断目录**不能**被当成一个记忆作用域。
+    // 判据是「目录里有 MEMORY.md」/ 按 cwd 算 slug，两者都不该命中 diagnostics。
+    check('诊断目录不含索引文件', existsSync(join(DIAG_DIR, 'MEMORY.md')), false)
+
+    rmSync(DIAG_DIR, { recursive: true, force: true })
+    llm = makeLlm()  // 还原
+  }
+
+  // ⭐ 回归：**LLM 调用失败 ≠ JSON 格式错误**（2026-10-12 实测根因）。
+  //
+  // 第一版埋点只记了 `finish <kind>`，拿到的现场是「终态 error、原文 0 字符」——
+  // 这证明不是 JSON 问题，但**说不出为什么调用会失败**（限流？超时？鉴权？），
+  // 排查到这一步又卡住。官方契约里 `error`/`aborted` 的 finish reason 必带
+  // `failure: LlmFailure`（message/code/status/requestId），必须一并留下。
+  //
+  // 这条测试锁住：失败详情要同时出现在**诊断文件**与 **error.log 那一行**里 ——
+  // 后者才是人工第一眼看的入口，不能让人为了看一个 code 去开文件。
+  console.log('\n回归：LLM 调用失败要留下 failure 详情')
+  {
+    resetForTest()
+    llmCalls.length = 0
+    const DIAG_DIR = join(paths.memoryRoot, 'diagnostics')
+    rmSync(DIAG_DIR, { recursive: true, force: true })
+
+    llm = makeLlm({ finishError: true })
+    const sErr = makeSession(turnEvents(11))
+    const lErr = createTurnStoppingListener({
+      getLlm: () => llm,
+      getSession: () => sErr,
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+      presetOf: () => 'standard-gitbash',
+    })
+    lErr({ agent, turn: 11 })
+    await settle()
+
+    const files = existsSync(DIAG_DIR) ? readdirSync(DIAG_DIR) : []
+    check('失败也生成了诊断文件', files.length, 1)
+    const dump = files.length > 0 ? readFileSync(join(DIAG_DIR, files[0]), 'utf8') : ''
+
+    // ① 终态是 error（不是 stop），原文为空 —— 复刻真实现场的关键特征
+    check('诊断标出 error 终态', dump.includes('finish 终态 error'), true)
+    check('诊断标出原文为空', dump.includes('原文长度   0 字符'), true)
+    check('明确未截断（排除 maxTokens 那个坑）', dump.includes('截断标记   否'), true)
+
+    // ② failure 详情逐项落盘 —— 这才是"为什么失败"的答案
+    check('诊断含 failure code', dump.includes('code=PROVIDER_UNAVAILABLE'), true)
+    check('诊断含 failure message', dump.includes('upstream is momentarily unavailable'), true)
+    check('诊断含 HTTP 状态', dump.includes('status=503'), true)
+    check('诊断含建议重试间隔', dump.includes('retryAfter=2000ms'), true)
+
+    // ③ error.log 那一行也要能独立定位（同样按结构字段，不按措辞）
+    const errLog = readFileSync(paths.errorLogFile, 'utf8')
+    const line = errLog.split('\n').filter((l) => l.includes('｜诊断 ') && l.includes('｜模型 ')).pop() ?? ''
+    check('error.log 含 failure code', line.includes('PROVIDER_UNAVAILABLE'), true)
+    check('error.log 含 failure message', line.includes('upstream is momentarily unavailable'), true)
+    check('error.log 含 HTTP 状态', line.includes('HTTP 503'), true)
+    check('error.log 含 finish error', line.includes('finish error'), true)
+    check('error.log 含原文 0 字符', line.includes('原文 0 字符'), true)
+
+    // ④ 调用失败仍要保留游标重试（既有语义不能被诊断改动）
+    llmCalls.length = 0
+    llm = makeLlm()
+    lErr({ agent, turn: 12 })
+    await settle()
+    check('调用失败后下一轮仍重试', llmCalls.length, 1)
+
+    rmSync(DIAG_DIR, { recursive: true, force: true })
+    llm = makeLlm()  // 还原
+  }
+
+  // ⭐ 回归：**措辞必须按实情分类**，不能写死一句因果断言（2026-10-12）。
+  //
+  // 元凶就是那句固定的「总结输出无法解析（JSON 不完整或格式错误）」：
+  // 它在"调用失败"时凭空断言了一个不存在的 JSON 格式问题，把人一路带向
+  // "调大 MAX_OUTPUT_TOKENS / 改解析器"，而真因是 `finish error`。
+  // 93 行日志、两轮排查，全因此跑偏。
+  //
+  // 这条测试锁住"四档互斥且判定顺序正确" —— 尤其**调用失败优先于其它档**，
+  // 否则调用失败会被降格成"输出为空"或"格式错误"，等于换个说法继续误导。
+  // ⭐ 回归：**后台调用必须照抄主对话的调用参数**（2026-10-12 真因）。
+  //
+  // 真事故：上游返回 400 / code 11150
+  //   「the reasoning effort value is not supported by the current model」
+  // 根因不是"模型不支持 high"（探测记录显示它接受 low..max，主对话传 high
+  // 一直正常），而是**插件只取了 provider/model，丢掉了 `reasoningEffort`**。
+  //
+  // 丢字段的后果不是"少传一个可选参数"，而是**静默换了来源**：pi-ai 对
+  // undefined 的 reasoningEffort 会回落到 **profile 级**
+  // （`dsh-llm-pi-ai/lib/index.js:1847`：`options.reasoningEffort ?? profile.reasoning`），
+  // 于是后台调用用的级别与主对话不是同一个，可能被上游拒绝。
+  //
+  // 官方契约（`dsh-llm/lib/types/call-config.d.ts`）说得很清楚：请求头的 config
+  // 是 `LlmCallConfig`，含 reasoningEffort/temperature/maxTokens/stop，
+  // 且**逐字段 1:1 映射**到 GenerateOptions，官方 loop 就是照它构造请求的。
+  console.log('\n回归：后台调用照抄主对话的调用参数')
+  {
+    resetForTest()
+    llmCalls.length = 0
+    // 请求头带上完整字段（含官方说的那几个），验证它们被原样带过去
+    const cfg = {
+      provider: 'workbuddy',
+      model: 'deepseek-v4.1-flash',
+      reasoningEffort: 'high',
+      temperature: 0.3,
+    }
+    const sParam = makeSession(turnEvents(41), 'standard', cfg)
+    const lParam = createTurnStoppingListener({
+      getLlm: () => llm,
+      getSession: () => sParam,
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+      presetOf: () => 'standard-gitbash',
+    })
+    lParam({ agent, turn: 41 })
+    await settle()
+
+    check('调用过一次', llmCalls.length, 1)
+    const sent = llmCalls[0] ?? {}
+    // 这是本次修复的核心断言：思考级别必须被显式传出，而不是留给适配器回落
+    check('传了 reasoningEffort', sent.reasoningEffort, 'high')
+    check('传了 temperature', sent.temperature, 0.3)
+    check('provider 与主对话一致', sent.provider, 'workbuddy')
+    check('model 与主对话一致', sent.model, 'deepseek-v4.1-flash')
+    // 关键：**不能因为"没传"而变成 undefined** —— undefined 正是回落 profile 的入口
+    check('reasoningEffort 明确不是 undefined', sent.reasoningEffort === undefined, false)
+
+    // 没有 reasoningEffort 的会话不能被编造出一个值来
+    llmCalls.length = 0
+    resetForTest()
+    const sNoEffort = makeSession(turnEvents(50), 'standard', {
+      provider: 'lmstudio', model: 'qwen3.5-4b',
+    })
+    const lNoEffort = createTurnStoppingListener({
+      getLlm: () => llm,
+      getSession: () => sNoEffort,
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+      presetOf: () => 'standard-gitbash',
+    })
+    lNoEffort({ agent, turn: 50 })
+    await settle()
+    check('主对话没给级别时不编造', llmCalls[0]?.reasoningEffort, undefined)
+    check('该情形仍照常调用', llmCalls.length, 1)
+  }
+
+  console.log('\n回归：失败措辞按实情分类（不再笼统说"JSON 格式错误"）')
+  {
+    const { classifyParseFailure } = await import('../src/summarize.mjs')
+
+    // ① 调用失败（真凶）：必须认成 call-failed，且**不能**出现 JSON 字样
+    const callFailed = classifyParseFailure({
+      raw: '', truncated: false, finishKind: 'error',
+      failure: { code: 'PROVIDER_UNAVAILABLE', message: 'boom', status: 503 },
+    })
+    check('调用失败 → summary-call-failed', callFailed.slug, 'summary-call-failed')
+    check('调用失败措辞不提 JSON', /JSON/.test(callFailed.label), false)
+    check('调用失败措辞点明未产出', callFailed.label.includes('未产出内容'), true)
+
+    // 即便 raw 非空（半截流），只要有 failure 就该归调用失败
+    const partial = classifyParseFailure({
+      raw: '{"notes":["半', truncated: false, finishKind: 'error', failure: { code: 'X' },
+    })
+    check('调用失败优先于是截断/格式', partial.slug, 'summary-call-failed')
+
+    // ② 被中止：与 error 同族但措辞要能分开
+    const aborted = classifyParseFailure({ raw: '', truncated: false, finishKind: 'aborted' })
+    check('被中止 → summary-call-failed', aborted.slug, 'summary-call-failed')
+    check('被中止措辞含"中止"', aborted.label.includes('中止'), true)
+
+    // ③ 截断：这才是"不完整"，但措辞说的是截断而非"格式错误"
+    const truncated = classifyParseFailure({ raw: '{"notes":["a', truncated: true, finishKind: 'max-tokens' })
+    check('截断 → summary-truncated', truncated.slug, 'summary-truncated')
+    check('截断措辞提 maxTokens', truncated.label.includes('maxTokens'), true)
+
+    // ④ 正常结束但空输出：是模型行为，不是链路故障，措辞要区分开
+    const empty = classifyParseFailure({ raw: '   ', truncated: false, finishKind: 'stop' })
+    check('空输出 → summary-empty-output', empty.slug, 'summary-empty-output')
+
+    // ⑤ 只有真的"有内容且不是 JSON"才配得上"无法解析"
+    const bad = classifyParseFailure({ raw: '我不是 JSON', truncated: false, finishKind: 'stop' })
+    check('真格式错 → summary-unparsable', bad.slug, 'summary-unparsable')
+    check('真格式错措辞才提 JSON', bad.label.includes('JSON'), true)
+
+    // 四档 slug 必须互不相同 —— 否则文件名撞车，按文件名筛就失去意义
+    const slugs = [callFailed.slug, truncated.slug, empty.slug, bad.slug]
+    check('四档 slug 互不重复', new Set(slugs).size, 4)
+  }
+
   console.log('\n回归：连续失败到上限后放弃（避免游标永久卡死）')
   {
     resetForTest()
@@ -889,7 +1190,9 @@ try {
     //
     // ⚠️ 这条用例必须让**既有文件名无法由 name 派生出来**，否则测不出区别：
     // 如果 name 派生的文件名恰好就是既有文件，回退路径也会"碰巧"更新同一个文件。
-    // 所以先手工写一个名字与标题不一致的文件，模型再按**文件名**（带前缀）去改它。
+    // 所以手工写一个文件名是 `feedback_历史条目.md`、标题是 `历史结论` 的文件
+    // （slug 派生不出该文件名），模型再按**文件名**（带前缀）去改它。
+    // 覆盖更新的前提是**标题一致** —— 这正是修复后新增的同名判据。
     resetForTest()
     const { writeMemory } = await import('../src/store.mjs')
     writeMemory(globalDir, {
@@ -909,8 +1212,8 @@ try {
           memories: [{
             type: 'feedback',
             scope: 'global',
-            // name 与文件名**不一致** —— 派生不出 feedback_历史条目.md
-            name: '完全不同的标题',
+            // name 与既有文件**一致** → 属于「同一条记忆覆盖更新」
+            name: '历史结论',
             description: '又改一次',
             content: '**Why:** 第二次改写。\n\n**How to apply:** 照旧。',
             file: 'memory/feedback_历史条目.md',
@@ -928,6 +1231,46 @@ try {
     check('既有文件内容被更新', readFileSync(
       join(globalMemoryDir, 'feedback_历史条目.md'), 'utf8',
     ).includes('第二次改写'), true)
+
+    // --- 2b) 带前缀但**标题不同** → 不许顶掉既有记忆（2026-10-18 修）
+    //
+    // 后台总结看不到正文，只凭清单里的文件名就填 `file` 是本次真事故的成因：
+    // global 的「社保国产化工作区与开发环境速查」被两个 sbf 工作区各抄一次，
+    // 于是「Tomcat 控制台乱码」「jackson CVE」两条无关记忆顶着别人的文件名存在。
+    resetForTest()
+    writeMemory(globalDir, {
+      file: 'feedback_历史条目.md',
+      type: 'feedback',
+      name: '历史结论',
+      description: '旧描述',
+      content: '旧正文。',
+    })
+    const beforeFiles2 = filesOf().length
+    const n2b = createTurnStoppingListener({
+      getLlm: () => makeLlm({
+        reply: JSON.stringify({
+          notes: [],
+          memories: [{
+            type: 'feedback',
+            scope: 'global',
+            // name 与目标文件**不一致** → 撞名，必须另起文件
+            name: '完全不同的标题',
+            description: '另一件事',
+            content: '**Why:** 另一件事的正文。\n\n**How to apply:** 照旧。',
+            file: 'memory/feedback_历史条目.md',
+          }],
+        }),
+      }),
+      getSession: () => makeSession(turnEvents(21)),
+      isDisabledFor: () => false,
+      logger: { warn: () => {}, info: () => {} },
+    })
+    n2b({ agent, turn: 21 })
+    await settle()
+    check('前缀+异名 → 另起文件而不是顶掉别人', filesOf().length, beforeFiles2 + 1)
+    check('原有记忆的正文还在', readFileSync(
+      join(globalMemoryDir, 'feedback_历史条目.md'), 'utf8',
+    ).includes('旧正文'), true)
 
     // --- 3) 不同主题但派生同名 → 防撞车（不覆盖）
     resetForTest()

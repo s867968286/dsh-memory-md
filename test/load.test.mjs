@@ -257,6 +257,86 @@ console.log('\n索引冻结：缓存上一次渲染的文本，返回值恒定�
   writeSettings({ enabled: true, freezeIndex: false, journal: false, disabledPresets: [] })
 }
 
+/* ---------- 压缩后自动失效（surface.replaceGeneration）----------
+ *
+ * 自动压缩 / `/compact` 提交 `surfaceOp.replace`，把历史里一段消息（含我们的
+ * 快照）替换成摘要 checkpoint。`Session.surface.replaceGeneration` 只在 replace
+ * 时递增（dsh-session/lib/index.js:464-468），append 不递增 —— 所以冻结缓存
+ * 必须带上渲染那一刻的代数，代数变了就重新渲染并**重新缓存**。
+ *
+ * ⚠️ 断言的是「文本内容」而不只是「返回值不相等」：重新渲染却拿到同一份旧
+ * 文本（例如误把缓存读成 generation 而非 text）同样会变红。
+ */
+console.log('\n压缩后自动失效：重新注入最新索引并重新缓存')
+{
+  const settingsFile = join(SANDBOX, 'memory-md', 'settings.json')
+  const globalDir = join(SANDBOX, 'memory-md', 'global')
+  const indexPath = join(globalDir, 'MEMORY.md')
+  const writeIndex = (body) => {
+    mkdirSync(globalDir, { recursive: true })
+    writeFileSync(indexPath, body, 'utf8')
+  }
+
+  // 一个带可变 replaceGeneration 的会话桩 —— 模拟压缩把它从 0 推到 1。
+  const surface = { replaceGeneration: 0 }
+  const shrinkSession = { header: { cwd: undefined }, surface }
+  const shrinkCtx = {
+    logger: { warn: () => {}, info: () => {} },
+    get(name) {
+      if (name === 'sessions') return { get: (id) => (id === 'sess-shrink' ? shrinkSession : undefined) }
+      return undefined
+    },
+    inject(deps, fn) {
+      const available = {
+        systemPrompt: {
+          section: () => () => {},
+          context(spec) {
+            shrinkContexts.push(spec)
+            return () => {}
+          },
+        },
+      }
+      if (!deps.every((d) => available[d] !== undefined)) return { dispose: () => {} }
+      fn({ ...shrinkCtx, ...Object.fromEntries(deps.map((d) => [d, available[d]])) })
+      return { dispose: () => {} }
+    },
+    on() { return () => {} },
+    emit() { return true },
+    effect(fn) { fn(); return () => {} },
+  }
+  const shrinkContexts = []
+  mod.apply(shrinkCtx, {})
+
+  const spec = shrinkContexts[0]
+  const indexText = () => spec.text({ agent: { id: 'sess-shrink' } })
+
+  writeFileSync(settingsFile, JSON.stringify({
+    enabled: true, freezeIndex: true, journal: false, disabledPresets: [],
+  }), 'utf8')
+
+  writeIndex('# MEMORY.md\n\n- [压缩前](a.md) — 旧索引\n')
+  const before = indexText()
+  check('压缩前：首次渲染', String(before).includes('旧索引'), true)
+
+  // 冻结生效：文件变了也不重新渲染，代数没变。
+  writeIndex('# MEMORY.md\n\n- [压缩前](a.md) — 旧索引\n- [新加](b.md) — 新索引\n')
+  check('冻结生效：代数未变时仍是旧文本', indexText(), before)
+
+  // ★ 压缩发生：replaceGeneration 递增 → 缓存失效 → 重新读盘。
+  surface.replaceGeneration += 1
+  const afterCompact = indexText()
+  check('压缩后：重新注入最新索引', String(afterCompact).includes('新索引'), true)
+  check('压缩后：不再是压缩前那份', afterCompact === before, false)
+
+  // 重新缓存：之后再次冻结（代数不变就不再变）。
+  writeIndex('# MEMORY.md\n\n- [压缩前](a.md) — 旧索引\n- [新加](b.md) — 新索引\n- [又加](c.md) — 更晚\n')
+  check('压缩后重新缓存：代数不变仍冻结', indexText(), afterCompact)
+
+  // 再压缩一次 → 再次刷新（代数递增是持久的，不是一次性）。
+  surface.replaceGeneration += 1
+  check('第二次压缩：再次刷新', String(indexText()).includes('更晚'), true)
+}
+
 // apply() 内部对工具注册失败只 warn 不抛 —— 这里确保没有静默降级。
 console.log('\napply() 期间没有告警')
 check('无告警', warnings, [])
@@ -329,6 +409,109 @@ console.log('\n依赖晚就绪：tools 后到也要补注册（防回归）')
   ])
   check('迟到的 systemPrompt 也注册了提示词段', lateSections.length, 1)
   check('迟到的 webServer 也注册了路由', lateRoutes.length, 1)
+}
+
+/* ---------- 兜底路由：必须走 currentSelection() ---------- */
+//
+// `dsh-agent-default-model` 的服务实例**只有** `currentSelection()` /
+// `saveSelection()` 两个方法，provider/model 封在 private 的 `config` 里
+// （schemastery 引用，不是字符串）——实例上根本没有 `.provider` / `.model`。
+//
+// 早先 `defaultRouteOf()` 直接读 `service.provider`，于是**恒定 undefined**：
+// 表现为「首轮还没有 requestHeader」时后台总结被跳过并写 error.log。
+//
+// 这条断言**端到端**驱动真实代码路径（`defaultRouteOf` 未导出，只能这么测）：
+// 造一个没有 requestHeader 的 session，触发 turn-stopping，看总结有没有真的发出
+// LLM 调用。旧写法下这里拿不到路由 → 一次调用都不会发生。
+console.log('\n兜底路由：无 requestHeader 时经 currentSelection() 兜底')
+{
+  const routeSandbox = join(tmpdir(), `mmd-route-${process.pid}`)
+  process.env.DSH_HOME = routeSandbox
+  mkdirSync(join(routeSandbox, 'memory-md'), { recursive: true })
+
+  const streamCalls = []
+  const routeListeners = new Map()
+
+  // 造一个**没有** requestHeader 的会话 —— 逼出 defaultRoute 兜底。
+  //
+  // 事件形状按真实契约（见 summarize.mjs 的 eventsSinceTurn / isHumanMessage）：
+  // 字段是 `type`（不是 kind）；必须有 `turn/start` 提供轮号；
+  // 真人发言靠 `data.source.kind === 'user'` 认，缺了就会被当快照过滤掉。
+  const agent = { id: 'agent-route-probe' }
+  const filler = 'x'.repeat(3000)
+  const session = {
+    header: { cwd: 'D:\\proj' },
+    // requestHeader() 返回 undefined：兜底路由是唯一出路。
+    requestHeader: () => undefined,
+    ownEvents: () => [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { content: filler, source: { kind: 'user' } } },
+      { type: 'assistant/message', data: { message: { content: filler } } },
+    ],
+  }
+
+  const routeCtx = {
+    logger: { warn: () => {}, info: () => {} },
+    get(name) {
+      if (name === 'agentDefaultModel') {
+        // 真实形状：只有方法，无 provider/model 字段。
+        return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-v4.1-flash' }) }
+      }
+      if (name === 'sessions') return { get: (id) => (id === agent.id ? session : undefined) }
+      return undefined
+    },
+    inject(deps, fn) {
+      const available = {
+        tools: { register: () => () => {} },
+        llm: {
+          stream(options) {
+            streamCalls.push(options)
+            return (async function* () {})()
+          },
+        },
+        systemPrompt: { section: () => () => {}, context: () => () => {} },
+        webServer: { register: () => () => {} },
+      }
+      if (!deps.every((d) => available[d] !== undefined)) return { dispose: () => {} }
+      fn({ ...routeCtx, ...Object.fromEntries(deps.map((d) => [d, available[d]])) })
+      return { dispose: () => {} }
+    },
+    on(name, fn) {
+      if (!routeListeners.has(name)) routeListeners.set(name, [])
+      routeListeners.get(name).push(fn)
+      return () => {}
+    },
+    emit(name, payload) {
+      for (const fn of routeListeners.get(name) ?? []) fn(payload)
+      return true
+    },
+    effect(fn) {
+      fn()
+      return () => {}
+    },
+  }
+
+  mod.apply(routeCtx, {})
+
+  // 首次见到该会话时游标锚定在 turn-1，所以这里 turn 必须 > 0 才有的可总结。
+  for (const fn of routeListeners.get('agent/turn-stopping') ?? []) fn({ agent, turn: 1 })
+
+  // 后台是 void 异步：等它跑起来。
+  await new Promise((resolve) => setTimeout(resolve, 300))
+
+  // 拿到兜底路由才会真的调用 llm.stream。
+  check('无 requestHeader 时兜底路由生效（发出了 LLM 调用）', streamCalls.length > 0, true)
+  check(
+    '兜底路由用的是 currentSelection() 的 provider',
+    streamCalls[0]?.provider,
+    'deepseek',
+  )
+
+  try {
+    rmSync(routeSandbox, { recursive: true, force: true })
+  } catch {
+    /* 清理失败不影响结论 */
+  }
 }
 
 try {

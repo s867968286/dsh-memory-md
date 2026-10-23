@@ -9,7 +9,9 @@
  * - 不共享模块、全局变量或样式表。
  *
  * - 只用一个官方 slot：`settings.section`（一个注册 = 一个设置页，导航行由官方渲染）；
- * - 不引任何 UI 组件库：React.createElement + 原生 input/button；
+ * - 开关用官方 primitives 的 `Switch`：本插件早期自绘过一个（当时官方还没有这个
+ *   组件），现在官方有了，自绘的那份圆角/颜色/焦点环都会和「通用设置」对不上；
+ * - 其余控件仍是 React.createElement + 原生 input/button；
  * - 数据全部走 Host 半的 `/memory-md/api/*`（同源 fetch）。
  */
 window.__ModuleLoader__.load({
@@ -17,6 +19,21 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
+    /*
+     * 设置页的开关用官方 primitives 的 Switch（本插件早期自绘过一份，当时官方
+     * 还没有这个组件；自绘那份的 10px 圆角与「通用设置」的胶囊开关对不上）。
+     *
+     * 必须包在 try/catch 里：该包曾经在某版本里缺失，顶层 require 一抛错，
+     * factory 就整个失败、apply 从不执行，设置页退化成裸 HTML（真事故，
+     * 见 test/client.test.mjs 的说明）。取不到时降级为只读文本。
+     */
+    let Switch = null
+    try {
+      const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+      Switch = primitives?.Switch ?? null
+    } catch {
+      Switch = null
+    }
 
     const API = '/memory-md/api'
     const SECTION_ID = 'memory-md'
@@ -27,19 +44,18 @@ window.__ModuleLoader__.load({
       '.mmd-err{color:var(--dsw-alias-state-error-primary,#c0392b);font-size:12px;line-height:1.6}',
       '.mmd-ok{color:var(--dsw-alias-state-success-primary,#2f9e44);font-size:12px;line-height:1.6}',
       '.mmd-sep{height:1px;background:var(--dsw-alias-border-l2,#eee);margin:2px 0}',
-      // 参数行：与 preset-md 的 .pmd-set-row 完全一致
-      '.mmd-set-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;min-width:0;min-height:52px;padding:8px 0;border-top:1px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
-      '.mmd-set-label{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
-      '.mmd-set-label b{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
-      '.mmd-set-label span{font-size:11px;color:var(--dsw-alias-label-tertiary,#8c8c8c);line-height:17px}',
+      // 参数行：逐项对齐官方「通用设置」的 DeveloperToolsRow ——
+      //   行     padding 16px 0 + .5px 底边分隔线（末行去掉）
+      //   标题   14px / 不加粗（600 只留给分组标题）
+      //   说明   12px / label-secondary / margin-top 4px
+      '.mmd-set-row{display:flex;justify-content:space-between;align-items:center;gap:24px;min-width:0;padding:16px 0;border-bottom:.5px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
+      '.mmd-set-row:last-child{border-bottom:none}',
+      '.mmd-set-label{flex:1;min-width:0;display:flex;flex-direction:column}',
+      '.mmd-set-label b{font-size:14px;font-weight:400;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:20px}',
+      '.mmd-set-label span{font-size:12px;font-weight:400;margin-top:4px;color:var(--dsw-alias-label-secondary,#6b6b6b);line-height:18px}',
       '.mmd-perm{display:flex;flex-direction:column}',
-      // 黑色开关（preset-md 同款）
-      '.mmd-switch{box-sizing:border-box;background:var(--dsw-alias-border-l3,#b8b8b8);cursor:pointer;border:0;border-radius:10px;flex:none;width:36px;height:20px;padding:2px;position:relative;transition:background-color .14s}',
-      '.mmd-switch-on{background:var(--dsw-alias-button-primary-fill,#1f1f1f)}',
-      '.mmd-switch:disabled{cursor:default;opacity:.5}',
-      '.mmd-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:2px}',
-      '.mmd-thumb{background:var(--dsw-alias-label-primary-foreground,#fff);border-radius:50%;width:16px;height:16px;transition:transform .12s;display:block}',
-      '.mmd-switch-on .mmd-thumb{transform:translate(16px)}',
+      // primitives 取不到时开关降级为只读文本（不该让整页失灵）。
+      '.mmd-set-unavailable{font-size:12px;color:var(--dsw-alias-label-tertiary,#8c8c8c)}',
       // 路径卡片（只有标题与路径行）
       '.mmd-card{border:.5px solid var(--dsw-alias-border-l4,#e0e0e0);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;background:transparent}',
       '.mmd-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}',
@@ -168,26 +184,22 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const toggle = (key) => h('button', {
-        type: 'button',
-        role: 'switch',
-        'aria-checked': Boolean(form[key]),
-        'aria-label': key,
-        className: 'mmd-switch' + (form[key] ? ' mmd-switch-on' : ''),
-        onClick: () => patch({ [key]: !form[key] }),
-      }, h('span', { className: 'mmd-thumb' }))
+      // 官方 Switch：圆角、开/关配色、焦点环、disabled 透明度都由它自己负责，
+      // 与「通用设置」里的开关是同一个组件，不会走样。
+      const toggle = (key, label) => (Switch === null
+        ? h('span', { className: 'mmd-set-unavailable' }, String(Boolean(form[key])))
+        : h(Switch, {
+          checked: Boolean(form[key]),
+          label: label ?? key,
+          onChange: (next) => patch({ [key]: next }),
+        }))
 
       const setRow = (key, title, desc) => h('div', { className: 'mmd-set-row', key },
         h('span', { className: 'mmd-set-label' },
           h('b', null, title),
           desc ? h('span', null, desc) : null),
-        toggle(key))
+        toggle(key, title))
 
-      /**
-       * 数字参数：标签在上、输入在下、默认值写进 placeholder。
-       *
-       * 「输入框是空的」= 正在用默认值，一眼能看出来。空串提交后由服务端回落默认。
-       */
       /**
        * 数字参数：标签在上、输入在下。
        *
@@ -215,14 +227,14 @@ window.__ModuleLoader__.load({
           h('span', { className: 'mmd-set-label' },
             h('b', null, '在这些预设下停用'),
             h('span', null,
-              '一行一个预设 id，支持 * 通配（如 presetmd-*）。' +
+              '一行一个预设 id，支持 * 通配（如 companion-mode）。' +
               '这些预设里的对话不会读写全局记忆 —— 适合自带独立记忆的预设。'),
             h('textarea', {
               className: 'mmd-textarea',
               value: form.disabledPresets,
               spellCheck: false,
               rows: 3,
-              placeholder: 'presetmd-*',
+              placeholder: 'companion-mode',
               onChange: (event) => patch({ disabledPresets: event.target.value }),
             }),
           ),
@@ -243,7 +255,8 @@ window.__ModuleLoader__.load({
             '关：不写日志。日志只写不读，永远不会被当成记忆加载。'),
           setRow('freezeIndex', '冻结记忆索引',
             '开：同一对话只注入一次索引，之后不再重复注入（记忆文件变了也不追加），省上下文。' +
-            '想刷新记忆时把开关关一下再打开。关：索引一变就注入最新的一份。'),
+            '上下文被压缩时会自动重新注入一次最新索引。想手动刷新时把开关关一下再打开。' +
+            '关：索引一变就注入最新的一份。'),
           // 双阈值：任一达标即触发一次后台总结（两者是「或」关系）。
           h('div', { className: 'mmd-fields' },
             num('minReviewTurns', '触发轮数', '轮'),

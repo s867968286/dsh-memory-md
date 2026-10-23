@@ -91,12 +91,17 @@ export function normalizeOutputSchema(schema) {
     const { required: isRequired, ...rest } = node
     if (isRequired === true) required.push(name)
     if (rest.type === 'array' && rest.items !== undefined) {
-      rest.items = normalizeOutputSchema(
-        // 数组元素同样可能是对象根
-        rest.items.type === 'object'
-          ? rest.items
-          : { type: 'object', properties: rest.items, additionalProperties: false },
-      )
+      if (rest.items.type === 'object') {
+        rest.items = normalizeOutputSchema(rest.items)
+      } else {
+        // 非 object 元素（string / integer / …）**透传**，只剥属性层可能残留的
+        // `required`。曾把它整个当 `properties` 包进一个对象 —— 元素被静默
+        // 错译成 `{"a": <string>}`。当前 5 个工具没有这种形状，属潜伏 bug；
+        // DSH 校验器原生支持标量 items（实测），透传即可。
+        const { required: itemRequired, ...itemRest } = rest.items
+        void itemRequired
+        rest.items = itemRest
+      }
     }
     properties[name] = rest
   }

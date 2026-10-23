@@ -26,7 +26,14 @@ import {
 } from './settings.mjs'
 import { ROUTE_PREFIX, registerRoutes } from './routes.mjs'
 import { memoryPromptText, renderMemoryIndex } from './inject.mjs'
-import { registerMemoryTools } from './tools.mjs'
+import {
+  TOOL_FORGET,
+  TOOL_JOURNAL,
+  TOOL_READ,
+  TOOL_SEARCH,
+  TOOL_WRITE,
+  registerMemoryTools,
+} from './tools.mjs'
 import { createTurnStoppingListener, forgetSession } from './summarize.mjs'
 
 export { DEFAULT_SETTINGS, readSettings, resolvePaths, writeSettings, ROUTE_PREFIX }
@@ -42,8 +49,42 @@ const cwdOf = (session) => {
  *
  * 用于「在这个预设下整体停用」的判断。没有 preset（未挂在任何预设下）
  * 或读不到时返回 undefined —— 那种情况永远不匹配停用名单，即默认生效。
+ *
+ * ⚠️ **不能只读 `session.header.agentPreset`。**
+ *
+ * header 是**创建时冻结**的元数据（`dsh-session/lib/index.js:1012` 只在
+ * `SessionStore.prepare` 时从 `meta.agentPreset` 写入一次）。0.1.7-rc.2 起
+ * 官方预设可以在会话创建后、blank 窗口内通过 `agent-preset/selected` 事件
+ * 切换（`dsh-agent-preset-registry/lib/index.js:761`），切换只更新
+ * `agentPreset` 投影，**header 不变**。实测：新建会话（默认
+ * standard-gitbash）→ 切「伙伴模式」的会话，header 仍是 standard-gitbash，
+ * 投影已是 companion-mode。
+ *
+ * 官方自己读当前预设也走投影而非 header
+ * （`dsh-api-session-controller/lib/index.js:340` 的 `presetForSession`）。
+ * host 侧的 session 对象不直接暴露投影当前值，但事件流就是这个投影的
+ * fold 源（`agentPresetProjectionDefinition.apply`），从事件流取最后一次
+ * `agent-preset/selected` 与官方读法等价 —— 这也是 dsh-companion 的同款读法
+ * （其 src/index.js:745-755）。
+ *
+ * 读法顺序：事件流里出现过切换事件 → 以最后一次为准；从未切换过 →
+ * 当前档就是创建时的 header 档，用 header 兜底。两者都取不到才返回
+ * undefined（默认生效）。
  */
 const presetOf = (session) => {
+  // 事件流折叠：官方 select 在 blank 窗口内 append 的切换事件。
+  let fromEvents
+  try {
+    for (const event of session?.ownEvents?.() ?? []) {
+      if (event?.type === 'agent-preset/selected') {
+        const id = event?.data?.agentPreset
+        if (typeof id === 'string' && id) fromEvents = id
+      }
+    }
+  } catch {
+    /* 事件流读不到（旧版本 / 非常规会话）→ 落到 header 兜底 */
+  }
+  if (fromEvents !== undefined) return fromEvents
   const id = session?.header?.agentPreset
   return typeof id === 'string' && id ? id : undefined
 }
@@ -88,9 +129,20 @@ export function apply(ctx, config = {}) {
    * 「工具被隐藏了、但后台行为还在」的半生效状态。
    *
    * 没有 agent（例如 host 侧无会话的调用）时不拦：默认全局生效。
+   *
+   * 性能：`shouldInject` 每 step 被 section + context 各调一次，每次都会走到
+   * 这里；每个工具调用还要再来一次。`presetOf()` 要全量折叠会话事件流，是
+   * 这里唯一的重活 —— 所以**先**读 settings，名单为空（默认配置）时直接短路
+   * 返回 false，事件流一次都不读。反过来先算 presetId 的话，默认配置下每个
+   * step 也要白白扫两遍事件流。
+   *
+   * `isPresetDisabled` 自身对空名单也会立即返回 false，但那发生在 presetOf
+   * **之后** —— 短路必须在这里做才有意义。
    */
   const isDisabledFor = (agent) => {
     if (agent === undefined || agent === null) return false
+    const { disabledPresets } = readSettings(paths)
+    if (!Array.isArray(disabledPresets) || disabledPresets.length === 0) return false
     const presetId = presetOf(sessionFor(agent))
     return isPresetDisabled(readSettings(paths), presetId)
   }
@@ -157,11 +209,139 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  // 索引冻结缓存：sessionId -> 上一次渲染出的索引文本。
+  // ---- 预设停用的工具可见性：停用预设下把 5 个 memory_md_* 从该会话的
+  //      模型可见工具列表里摘掉（「等价于该预设下没有本插件」的最后一口子）
+  //
+  // 为什么需要：工具注册（上方 ctx.inject(['tools'])）是**进程级全局**的，
+  // 注册时不知道将来哪个会话处于哪个预设。`assertPresetAllowed`（tools.mjs）
+  // 能拦住**调用**，拦不住工具出现在 request/header 的工具列表里 —— 模型
+  // 看得到工具与描述、退不出「有记忆可用」的姿态，对停用语义来说是半生效。
+  //
+  // 官方通道是 per-scope 的 `tools.restrict({ deny })`，**必须在 agent 自己的
+  // scope ctx 里调**：dsh-tools/lib/index.js:2895-2897 对 context-global 调用
+  // 直接抛错（"a context-global restriction would mask every agent"）。官方
+  // 自己的用法是 subagent 装配时在 childCtx 里收窄（dsh-subagent/lib/index.js:522
+  // `childCtx.tools.restrict(composition.toolFilter)`）。本插件走同一通道：
+  // `agent/created` 拿 `agent.ctx`（每会话 scope），命中停用名单就 deny。
+  //
+  // 收窄为什么等于"从列表消失"：请求头的工具数组每次装配都现算 ——
+  // systemPrompt.assemble() 收集 tools ← dsh-tools 的 wireSchemas(scope)
+  // （dsh-tools/lib/index.js:2707,2831）→ view(scope).visible（:2973 经
+  // admits() 做 restriction 交集，:2641-2644）。挂上 deny 即不可见，摘掉
+  // 即恢复；工具面变化时 loop 自动重记 request/header（reason="change"）
+  // 并追加 tool-removal/addition 消息（dsh-agent-loop/lib/index.js:1215-1229）。
+  //
+  // 不用担心对话中途清单抖动：官方把预设切换锁死在 blank 窗口（首回合后
+  // select 抛 agent-preset/locked，"This session has already started"），
+  // 挂/摘都发生在第一条模型请求之前，定了就不再变。
+  //
+  // ⚠️ 判定必须走 `presetOf`（事件流折叠，本文件上方），**不能**读 header：
+  // 新建会话（header=standard-gitbash）→ blank 窗口内切伙伴模式，header
+  // 恒为创建时的档。监听 `agent-preset/selected` 事件时参数直接带 presetId，
+  // 与投影天然一致。
+  //
+  // 时序：restrict 只接受**真实存在**的全局工具名（不存在会抛 "names unknown
+  // global tool"，dsh-tools/lib/index.js:2908-2910），而本插件工具是延迟注册
+  // 的 —— `agent/created` 先于注册齐的极端时序下预检会失败，此时记入
+  // pendingRestrict，等 `tools/change`（ScopedLayers 在注册面变化时广播，
+  // dsh-tools/lib/index.js:2689-2691）补一刀。常规时序（新建会话）里 agent
+  // loop 装配依赖 tools 服务，agent/created 必然晚于注册，补刀只是兜底。
+  const restrictionDisposers = new Map() // sessionId -> disposer
+  const pendingRestrict = new Map() // sessionId -> session（工具未注册齐时挂起）
+  const agentCtxBySession = new Map() // sessionId -> agent scope ctx
+  const MEMORY_TOOL_NAMES = [TOOL_WRITE, TOOL_SEARCH, TOOL_READ, TOOL_FORGET, TOOL_JOURNAL]
+
+  /**
+   * 对一个会话施加（或解除）工具收窄。
+   *
+   * @returns 'applied' 挂上了 | 'not-needed' 预设未命中（已顺手摘掉旧的）
+   *   | 'not-ready' 命中但工具未注册齐（由调用方决定挂起重试）
+   */
+  const applySessionRestriction = (session, agentCtx) => {
+    const sessionId = session?.id
+    if (typeof sessionId !== 'string' || sessionId === '') return 'not-needed'
+    if (!agentCtx || typeof agentCtx.tools?.restrict !== 'function') return 'not-needed'
+
+    // 先撤旧的：预设切换/重试时保证一个会话最多一条收窄记录。
+    // disposer 是 layers.effect 挂在 agent scope 上的，重复调用幂等无害。
+    try { restrictionDisposers.get(sessionId)?.() } catch { /* 已撤 */ }
+    restrictionDisposers.delete(sessionId)
+
+    if (!isPresetDisabled(readSettings(paths), presetOf(session))) return 'not-needed'
+
+    // 预检名字集合（与 restrict 内部校验同源，view(scope).restrictableNames）。
+    // 拿不到集合（旧版本）时直接试 restrict，失败由外层 catch 兜住。
+    let known
+    try {
+      known = agentCtx.tools.view?.()?.restrictableNames
+    } catch { /* view 不可用 → 跳过预检 */ }
+    if (known instanceof Set) {
+      for (const name of MEMORY_TOOL_NAMES) {
+        if (!known.has(name)) return 'not-ready'
+      }
+    }
+
+    restrictionDisposers.set(sessionId, agentCtx.tools.restrict({ deny: MEMORY_TOOL_NAMES }))
+    return 'applied'
+  }
+
+  ctx.on('agent/created', function (payload) {
+    const agent = payload?.agent
+    const session = agent?.session
+    if (!session?.id) return
+    // ⚠️ 必须存 **`agent.ctx`**（真正的 per-agent scope），不能存监听器的
+    // `this` —— 官方把事件 `this` 标为 `Scoped<Agent>`，只是作用域路由标记，
+    // 没有方法成员（dsh-companion src/index.js:814-832 有完整实测记录）。
+    agentCtxBySession.set(session.id, agent?.ctx)
+
+    const result = applySessionRestriction(session, agent?.ctx)
+    if (result === 'not-ready') pendingRestrict.set(session.id, session)
+  })
+
+  // 官方预设切换：dsh-agent-preset-registry/lib/index.js:484-489 把
+  // `agent-preset/selected` 会话事件转广播为 `(sessionId, presetId)`。
+  // 命中 → 挂；切走 → 摘（applySessionRestriction 开头的"先撤旧的"覆盖）。
+  // 事件早于本插件注册时序不可能漏：恢复旧会话时 agent/created 里会用
+  // presetOf 折叠出已切换过的预设，直接按命中处理。
+  ctx.on('agent-preset/selected', (sessionId, presetId) => {
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    const session = sessionsStore()?.get?.(sessionId)
+    const agentCtx = agentCtxBySession.get(sessionId)
+    if (!session || !agentCtx) return // agent 未创建/已销毁：无 scope 可挂
+    const result = applySessionRestriction(session, agentCtx)
+    if (result === 'not-ready') pendingRestrict.set(sessionId, session)
+  })
+
+  // 工具注册面变化时补一刀：覆盖「agent/created 先于本插件工具注册齐」的时序。
+  ctx.on('tools/change', () => {
+    if (pendingRestrict.size === 0) return
+    for (const [sessionId, session] of [...pendingRestrict]) {
+      const agentCtx = agentCtxBySession.get(sessionId)
+      const result = applySessionRestriction(session, agentCtx)
+      if (result !== 'not-ready') pendingRestrict.delete(sessionId)
+    }
+  })
+
+  ctx.on('agent/disposed', (payload) => {
+    const session = payload?.agent?.session
+    const sessionId = session?.id
+    if (typeof sessionId !== 'string') return
+    try { restrictionDisposers.get(sessionId)?.() } catch { /* 已撤 */ }
+    restrictionDisposers.delete(sessionId)
+    pendingRestrict.delete(sessionId)
+    agentCtxBySession.delete(sessionId)
+  })
+
+  // 索引冻结缓存：sessionId -> { text, generation }。
+  //
+  // `text` 是上一次渲染出的索引文本，`generation` 是渲染那一刻的
+  // `session.surface.replaceGeneration` —— 后者变化（压缩替换了历史）即视为
+  // 缓存失效，重新渲染并重新缓存。详见下方 context() 里的说明。
   //
   // 挂在**根 ctx** 而不是 `ctx.inject` 的子 scope 里 —— cordis 的事件沿作用域
-  // **向上冒泡**，而 `memory-md/settings-changed` 由 routes 在根 ctx 上 emit，
-  // 子 scope 根本收不到（与 `agent/turn-stopping` 那次是同一个坑，见下方 :247）。
+  // **向上冒泡**，而 `memory-md/settings-changed` 由 webServer scope 里的 routes
+  // emit（routes.mjs 的 PUT /api/settings），冒泡到根 ctx 才被这里的监听收到
+  // （与 `agent/turn-stopping` 那次是同一个坑，见下方 turn-stopping 注册处）。
   const frozenIndex = new Map()
 
   // 设置页保存后清空缓存 —— 这正是 routes.mjs:100 那个
@@ -270,13 +450,37 @@ export function apply(ctx, config = {}) {
           return render()
         }
 
-        // 开着冻结 → 只在缓存缺失时渲染一次，之后恒返回缓存。
-        // 想刷新就把开关关一下再打开（缓存被清），或直接关掉。
+        // 开着冻结 → 缓存命中就恒返回缓存，只在缓存缺失或**失效**时重新渲染。
+        //
+        // ## 失效判据：`surface.replaceGeneration`
+        //
+        // 自动压缩（dsh-compaction-basic）或 `/compact` 提交的是
+        // `surfaceOp.replace` —— 它把历史里一段消息替换成摘要 checkpoint。
+        // 我们的快照在会话早期注入、必然落在被压区间里，于是压缩后**历史里
+        // 已经不存在那条快照**了：loop 那边 `RuntimeContextProjection` 监听
+        // replacement 事件时会 `retained = null`（dsh-agent-loop/lib/index.js:325），
+        // 下一轮就会追加一份新快照。
+        //
+        // 问题在于：若不在这里配合，追加的还是缓存里那份**旧索引文本** ——
+        // 压缩给了刷新时机，注入的却不是最新记忆。
+        //
+        // `replaceGeneration` 精确编码了这件事：它只在 surface 发生 replace 时
+        // 递增（dsh-session/lib/index.js:464-468），append（含我们自己的快照注入）
+        // 不递增。所以「代数变了」＝「历史被替换过」＝「我缓存的文本可能已不在历史里」，
+        // 正是重置缓存的时机。比监听 `compaction/summary` 更通用：手动 `/compact`
+        // 走同一个后端方法 `ctx.compaction.compactNow()`（dsh-command-compact
+        // lib/index.js:48-58），顺带覆盖工具结果裁剪这类 replace。
+        //
+        // 取不到 session 时 generation 为 undefined，`cached.generation === generation`
+        // 恒成立 —— 退化成"纯冻结"，与改动前行为一致。
+        const generation = sessionFor(agent)?.surface?.replaceGeneration
         const cached = frozenIndex.get(id)
-        if (cached !== undefined) return cached
-        const first = render()
-        frozenIndex.set(id, first)
-        return first
+        if (cached !== undefined && cached.generation === generation) return cached.text
+
+        // 未命中（或发生过 surface 替换）→ 重新读盘渲染并**重新缓存**。
+        const text = render()
+        frozenIndex.set(id, { text, generation })
+        return text
       },
     })
   })
@@ -305,9 +509,35 @@ export function apply(ctx, config = {}) {
     defaultRoute: () => defaultRouteOf(ctx),
     // 与 tools/routes 同一个基准 —— 否则后台总结会写到另一个记忆根目录。
     dshHome: paths.dshHome,
+    // 诊断输出要记 preset。复用这里的实现，不在 summarize 里重写一份。
+    presetOf,
     logger,
   })
   ctx.on('agent/turn-stopping', listener)
+
+  // ---- 记忆库体检：已改为**技能**，插件不再注册 `/memory-check`
+  //
+  // 斜杠命令这条路由走不通，三条实测原因：
+  //
+  // 1. **报告渲染不出来**。`CommandResult.text` 在 UI 里被渲染成 `GenericCommandCard`，
+  //    默认折叠（`dsh-client-ui-chat/lib/client.js` 的 `expanded` 初值为 false），
+  //    一份多行报告被压成一行显示 —— 用户点 `/memory-check` 看到的就是「没反应」。
+  // 2. **拿不到图标与本地化标题**。`dsh-client-ui-commands` 的 `builtinRowFace()`
+  //    只给 `BUILTINS` 里那 6 个官方 `definitionId` 提供 `HOST_FACES`（含中文与图标）；
+  //    第三方命令只有 `name` + `description`，且 client 侧补一个同名 contribution
+  //    会直接抛 `collides with a host command`。host 侧 descriptor 本身也没有
+  //    label/icon 字段（`dsh-commands` 的 `normalizeDefinition`）。
+  // 3. **报出问题后无处可去**。命令只回答「哪里有问题」，不回答「该怎么修」，
+  //    而这正是体检真正有价值的部分。
+  //
+  // 技能形态同时解决三条：报告进正文（模型直接说给用户听）、判据与修法都写在
+  // SKILL.md 里、模型还能顺手 read/grep 去核实再判断。落地在
+  // `~/.dsh/skills/memory-check/`（SKILL.md + scripts/checkup.mjs + test/）。
+  //
+  // 原 `src/checkup.mjs` 与 `test/checkup.test.mjs` 已随命令一起删除：
+  // 判据只保留技能脚本这一份，避免两处实现漂移。判据的回归测试也随之迁到
+  // 技能的 `test/checkup.test.mjs`。
+
   // ---- 会话结束：强制写一次，然后清状态
   //
   // 为什么必须 force：`turn-stopping` 在「内容不足」时会故意不写（留给下轮回补），
@@ -324,8 +554,6 @@ export function apply(ctx, config = {}) {
       // 清理路径上的失败绝不能抛出去。
       logger?.warn?.(`[memory-md] 会话结束总结触发失败: ${String(error)}`)
     }
-    // agent 销毁时清掉会话状态，别让 Map 无限增长。
-    //
     // agent 销毁时清掉会话状态，别让 Map 无限增长。
     // 索引冻结缓存同理 —— 它在根 ctx 上，这里够得着，一并清掉。
     const id = agent?.id
@@ -344,11 +572,41 @@ export function apply(ctx, config = {}) {
  */
 function defaultRouteOf(scope) {
   try {
-    // `agentDefaultModel` 直接挂 provider/model（见该包的类型声明）。
+    // ⚠️ 必须走 `currentSelection()`，**不能**直接读 `service.provider` / `service.model`。
+    //
+    // 这个服务（`dsh-agent-default-model`）公开面只有两个方法：
+    // `currentSelection()` 与 `saveSelection()`；provider/model 封在 private 的
+    // `config` 里（schemastery 引用，不是字符串），实例上根本没有这两个字段。
+    // 官方所有消费方一律调 `currentSelection()`
+    // （dsh-headless/lib/index.js:302、dsh-api-session-controller/lib/index.js:292,461、
+    // dsh-webhook/lib/index.js:89）。
+    //
+    // 早先直接读 `service.provider` 的结果是**恒定 undefined**：类型检查看不出来
+    // （JS 无类型），只在"首轮还没有 requestHeader"时表现为总结被跳过 + 写 error.log。
     const service = scope.get?.('agentDefaultModel')
-    const provider = service?.provider
-    const model = service?.model
-    if (typeof provider === 'string' && typeof model === 'string') return { provider, model }
+    const selection = service?.currentSelection?.()
+    const provider = selection?.provider
+    const model = selection?.model
+    if (typeof provider === 'string' && typeof model === 'string') {
+      // ⚠️ **不能只取 provider/model**。`currentSelection()` 返回的是完整选择
+      // —— 它自己也带 `reasoningEffort`（`dsh-agent-default-model/lib/index.js:38-45`），
+      // 与请求头里的 `LlmCallConfig` 是同一组字段
+      // （`dsh-llm/lib/types/call-config.d.ts`：provider/model/reasoningEffort/
+      // temperature/maxTokens/stop，且**逐字段 1:1 映射**到 GenerateOptions）。
+      //
+      // 丢掉它会**静默改变语义**：pi-ai 适配器对 `options.reasoningEffort` 为
+      // undefined 的情形会回落到 **profile 级** reasoning
+      // （`dsh-llm-pi-ai/lib/index.js:1847`：`options.reasoningEffort ?? profile.reasoning`），
+      // 于是后台调用用的级别与主对话**不是同一个来源**，可能被上游拒绝。
+      // 真实事故（2026-10-12）：上游 400 / code 11150
+      // 「the reasoning effort value is not supported by the current model」。
+      const reasoningEffort = selection?.reasoningEffort
+      return {
+        provider,
+        model,
+        ...(typeof reasoningEffort === 'string' && reasoningEffort ? { reasoningEffort } : {}),
+      }
+    }
   } catch {
     /* 忽略 */
   }

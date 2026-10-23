@@ -119,17 +119,35 @@ for (const scope of scopes) {
   }
 
   // 修正索引链接：`](name.md)` → `](memory/name.md)`。
+  //
+  // 必须只认**条目行的链接**，不能全串替换。条目行形状固定为
+  // `- [标题](链接) — 描述`，而描述里可能出现与文件名同形的字符串 ——
+  // 例如描述引用了另一条记忆：「见 ](b.md)」。全串替换会把描述一并改掉，
+  // 与 store.mjs 的 `indexLineTargets()` 用真事故换来的教训同构（那边同样
+  // 因此改成了行首匹配）。这里按行做同样的行首判定。
   const indexPath = join(dir, MEMORY_ENTRYPOINT)
   let indexFixed = 0
   if (moved.length > 0) {
-    const index = readFileSync(indexPath, 'utf8')
-    let next = index
-    for (const name of moved) {
-      const before = next
-      next = next.split(`](${name})`).join(`](${MEMORY_DIR}/${name})`)
-      if (next !== before) indexFixed++
+    const lines = readFileSync(indexPath, 'utf8').split('\n')
+    const fixedNames = new Set()
+    for (let i = 0; i < lines.length; i++) {
+      let line = lines[i]
+      for (const name of moved) {
+        // 文件名里可能出现正则元字符（slug 化后基本不会，但不赌）——转义后构造。
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        // 标题里允许**一对方括号**（`byte[]`、`[废弃]` 之类）：用 `[^\]]*` 时
+        // 这类条目的整行都匹配不上，链接就修不了、迁移完仍是旧形态。
+        // 与 store.mjs 的 `indexLineTargets()` 是同一套判据，改一处要同步另一处。
+        const m = new RegExp(`^(- \\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])\\(${escaped}\\)`).exec(line)
+        if (m !== null) {
+          line = `${m[1]}(${MEMORY_DIR}/${name})${line.slice(m[0].length)}`
+          fixedNames.add(name)
+        }
+      }
+      lines[i] = line
     }
-    if (next !== index && !dryRun) writeFileSync(indexPath, next, 'utf8')
+    indexFixed = fixedNames.size
+    if (fixedNames.size > 0 && !dryRun) writeFileSync(indexPath, lines.join('\n'), 'utf8')
   }
 
   totalMoved += moved.length

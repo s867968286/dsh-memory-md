@@ -105,10 +105,21 @@ export function isPresetDisabled(settings, presetId) {
 /**
  * 解析 dshHome 与设置文件路径。
  *
- * `memoryRoot`（`<dshHome>/memory-md/`）里放三类东西：
+ * `memoryRoot`（`<dshHome>/memory-md/`）里放四类东西：
  *   - `settings.json` —— 设置
  *   - `error.log` —— 错误日志（与设置同一层，人工排查看这一层就够）
+ *   - `diagnostics/` —— 后台总结失败时的**原始输出**全文（见下）
  *   - `global/`、`<slug>/` —— 各作用域目录（内含索引 + `memory/` + `.journal/`）
+ *
+ * `diagnostics/` 只在一行 `error.log` 说不清问题时才有内容。error.log 记的是
+ * "哪一轮、哪个模型、败在哪一步"，但**看不到模型到底输出了什么** —— 而
+ * "JSON 不完整"有太多互斥的成因（撞输出上限被截断 / 模型压根没输出 JSON /
+ * 输出了多段 JSON / 推理内容混进了正文）。没有原文就只能靠猜，这正是本次
+ * 排查卡住的地方：93 行日志没有一行能回答"坏在哪里"。
+ *
+ * 它**不会被当成作用域**：作用域目录要么按 cwd 算 slug（`global`/`<slug>`），
+ * 要么按「含 MEMORY.md」扫（`scripts/migrate-memory-layout.mjs` 的
+ * `findScopes()`），两条都轮不到它。
  */
 export function resolvePaths(home) {
   const dshHome = dshHomeDir(home) ?? joinPath(process.cwd(), '.dsh')
@@ -118,6 +129,7 @@ export function resolvePaths(home) {
     memoryRoot,
     settingsFile: join(memoryRoot, 'settings.json'),
     errorLogFile: join(memoryRoot, 'error.log'),
+    diagnosticsDir: join(memoryRoot, 'diagnostics'),
   }
 }
 

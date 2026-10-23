@@ -610,7 +610,7 @@ error 回合照样总结。
 
 ## 5. 非 DSH 产品参考
 
-> 这两款的分析材料在 `docs/memory-scheme-{codebuddy,workbuddy}.md`，
+> 这两款的分析材料在 `docs/research/memory-scheme-{codebuddy,workbuddy}.md`，
 > 本节只提炼**与注入机制相关**的部分。
 
 ### 5.1 CodeBuddy —— 工程检索派
@@ -712,7 +712,7 @@ during injection. Before proceeding with the user's task, you MUST first clean u
 | 超限处理 | ⭐ **强制模型自清理** | 双级截断 + 标记 |
 | 热重载 | ✅ 每次装配重读 | ❌ **必须重启** |
 
-**dsh-memory-md 的选型（已定案，见 `docs/plan.md`）**：
+**dsh-memory-md 的选型（已定案，见 `docs/design/plan.md`）**：
 以 CodeBuddy 为主干（索引格式 / typed 四分类 / 搜索指引 / 行数限制），吸收 WorkBuddy 的提示词规则，自研插件落地，**每次装配重读 → 热更新**。
 
 **吸收关系（2026-09-13 更正，此前本文档归错了位置）**：
@@ -728,13 +728,13 @@ during injection. Before proceeding with the user's task, you MUST first clean u
 > **教训：正负清单必须成对出现 —— 只给约束不给目标，等于没给规则。**
 > 另有语境陷阱：WorkBuddy 的负面清单是给"主模型写日志"定的，防它顺手贴搜索结果；
 > 我们的日志由**后台总结模型**写，它这一轮干的就是搜索与分析，原样照搬会禁止它
-> 记录自己的主要产出。详见 `docs/plan.md` 第 7.3 节。
+> 记录自己的主要产出。详见 `docs/design/plan.md` 第 7.3 节。
 
 ---
 
 ## 6. dsh-memory-md 自身基线
 
-> 改这个插件前必读。**需求真源是用户 + `docs/plan.md`，不是本文档。**
+> 改这个插件前必读。**需求真源是用户 + `docs/design/plan.md`，不是本文档。**
 
 ### 6.1 两段式注入
 
@@ -831,9 +831,9 @@ during injection. Before proceeding with the user's task, you MUST first clean u
 | 四款插件的机制与行号 | 实读源码 |
 | CodeBuddy / WorkBuddy | 前人分析材料（非本次实读） |
 
-> CodeBuddy 与 WorkBuddy 两节**基于 `docs/memory-scheme-*.md` 的既有材料**，
+> CodeBuddy 与 WorkBuddy 两节**基于 `docs/research/memory-scheme-*.md` 的既有材料**，
 > 本次未重新验证其源码。引用时注意这一点。
 
 ---
 
-*文档结束。改动建议：本文件是**研究记录**，不是需求。需求见 `docs/plan.md`。*
+*文档结束。改动建议：本文件是**研究记录**，不是需求。需求见 `docs/design/plan.md`。*

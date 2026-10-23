@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-import { MEMORY_ENTRYPOINT, parseMemoryFrontmatter } from './codebuddy-port.mjs'
+import { MEMORY_ENTRYPOINT, MEMORY_TYPES, parseMemoryFrontmatter } from './codebuddy-port.mjs'
 
 /**
  * 生成 manifest 时每个文件最多读多少字符。
@@ -43,6 +43,23 @@ export const MANIFEST_MAX_ENTRIES = 200
  */
 const SAFE_FILE = /^[^/\\:*?"<>|]+\.md$/
 export const isSafeFile = (name) => SAFE_FILE.test(name) && !name.includes('..')
+
+/**
+ * 记忆正文的保留文件名：索引 `MEMORY.md`（`MEMORY_ENTRYPOINT`）**不是**记忆正文。
+ *
+ * ## 为什么必须显式排除
+ *
+ * 索引在作用域**根**、正文在 `memory/` 子目录（见 `MEMORY_DIR`）。而
+ * `isSafeFile('MEMORY.md')` 单看文件名是合法的 —— 没有 `normalizeMemoryFile()`
+ * 这道闸时，`memory_md_save file="MEMORY.md"` 会在 `memory/` 里写出一个同名
+ * 正文、再往索引里加一条指向它的死链，`memory_md_forget` 同理。
+ *
+ * 三个消费方（save / forget / read）都从 `normalizeMemoryFile()` 过这道闸，
+ * 所以这里收口一次，三处同时生效。
+ *
+ * @returns true 表示该名字是索引，不能当正文处理。
+ */
+export const isEntrypointName = (name) => name === MEMORY_ENTRYPOINT
 
 /**
  * 把模型给的 `file` 参数归一成**纯文件名**；不合法时返回 undefined。
@@ -76,6 +93,8 @@ export function normalizeMemoryFile(raw) {
   // 剥前导 `./` 与作用域目录前缀；只剥一层，剥完重新校验。
   name = name.replace(/^\.\//, '')
   if (name.startsWith(`${MEMORY_DIR}/`)) name = name.slice(MEMORY_DIR.length + 1)
+  // 索引不是正文：save/forget 必须拒绝它（read 有专门的索引分支，不走这里）。
+  if (isEntrypointName(name)) return undefined
   return isSafeFile(name) ? name : undefined
 }
 
@@ -206,6 +225,45 @@ export function listMemoryFiles(dir) {
 }
 
 /**
+ * 让 `memory_md_read` 的列表**包含索引条目**（`file: "MEMORY.md"`）。
+ *
+ * ## 为什么要有这一条
+ *
+ * read 的 description 承诺 `file` 可传 `"MEMORY.md"` 读索引全文，而列表是
+ * 模型找"能传什么"的唯一入口 —— 列表里没有它，承诺就是空头支票（E1）。
+ * 搜索工具已把索引一并扫掉（`tools.mjs` 的 targets 构造），列表口径应一致。
+ *
+ * 索引由插件独占维护，没有 frontmatter —— 元信息用固定值，type 标成
+ * `'index'`（不在四种记忆类型里，模型不会把它当正文记忆对待）。
+ *
+ * ## 为什么必须回填 `scope`
+ *
+ * `memory_md_read` 的输出 schema 把 `scope` 标成 required，而列表里**只有**
+ * 这些索引条目不是由 tools 侧拼的 —— 早先漏了这个字段，`scope=all`
+ * （默认值）一调就整块输出校验失败：
+ *
+ *   invalid output: missing required property "value.entries[0].scope"
+ *
+ * 而且 `scope=all` 恰好**总是**把 global 索引排在下标 0，等于默认路径必炸。
+ * 调用方只有一处（`tools.mjs` 的 read 列表），把作用域传进来即可。
+ *
+ * @param dir - 该作用域的记忆目录。
+ * @param scope - 该目录属于哪个作用域（`global` / `project`），回填进条目。
+ * @returns 索引文件不存在时返回 []；存在则单条条目。
+ */
+export function indexEntryFor(dir, scope) {
+  const raw = readText(join(dir, MEMORY_ENTRYPOINT))
+  if (raw === undefined) return []
+  return [{
+    scope,
+    file: MEMORY_ENTRYPOINT,
+    name: MEMORY_ENTRYPOINT,
+    description: `记忆索引（由插件维护）。传 file="${MEMORY_ENTRYPOINT}" 可读取全文。`,
+    type: 'index',
+  }]
+}
+
+/**
  * 扫出某个作用域里已有的记忆条目，带元信息与修改时间。
  *
  * ## 为什么需要它
@@ -292,16 +350,35 @@ export function formatMemoryManifest(manifest) {
  * 引用另一条记忆的链接在**协议里是被鼓励的**（"细节写进条目文件"），
  * 所以这不是臆想出来的输入，是自然会写出来的描述。
  *
- * ## 精确判据
+ * ## 标题里可以含 `]`，所以不能用「标题中不含 `]`」的字符类
  *
- * 条目行由**我们自己**生成，形状固定：`- [标题](链接) — 描述`。
- * 所以只认**紧跟标题闭合括号的那一段链接** —— 也就是从行首到 `](file)`
- * 的第一次出现处，且其前必须是 `[` 起的标题（即行首是 `- [`）。
- * 用非贪婪匹配锁住第一个 `](...)`，描述里的任何链接都不会被看到。
+ * 早先这里写的是 `/^- \[[^\]]*\]\(([^)]*)\)/`。`[^\]]*` 遇上标题里的方括号
+ * （实测最常见的是 `byte[]`）就会在**第一个** `]` 处截断，后面接不上 `](`，
+ * 整行解析失败 —— 于是 upsert 每次都判定「索引里没有这条」而继续追加，
+ * 索引里堆出同一行的多份副本（实测 7 份），模型读索引看到重复条目，
+ * 人工也永远对不上账。
+ *
+ * ## 但也不能无条件「从右往左」切
+ *
+ * 描述里出现 `](memory/b.md)` 是**自然写法**（协议还鼓励"细节写进条目文件"）。
+ * 若一路取到行内最后一个 `](`，这条：
+ *
+ *   `- [甲](memory/a.md) — 见 ](memory/b.md) 那条`
+ *
+ * 会被切成标题 `甲](memory/a.md) — 见 `、链接 `memory/b.md` —— 于是写乙时
+ * **把甲的行顶掉**、删乙时**连带删掉甲**，正是下面这段注释里记录的真事故。
+ *
+ * ## 所以：只允许**一对方括号**出现在标题里
+ *
+ * `\[[^\[\]]*\]` 这一分支专为 `byte[]` / `byte[1024]` 这类标题准备；不含方括号的
+ * 标题仍走 `[^\[\]]*`。两者都不允许再嵌一层 `](`，描述里的链接因此照旧看不见。
+ * 权衡：标题里若出现**多个**方括号组（如 `a[b]c[d]`）仍会解析失败 —— 但那种标题
+ * 本身罕见，且失败是**显式不匹配**（不会误删别人的行），比误伤更安全。
  */
 function indexLineTargets(line, file) {
-  // 只匹配行首的 `- [标题](链接)`，不扫描述部分。
-  const m = /^- \[[^\]]*\]\(([^)]*)\)/.exec(line)
+  // 只认行首的 `- [`，避免命中正文或描述里的行。
+  // 标题段：普通字符，或**一**对方括号（`byte[]`、`[废弃]` 之类）。
+  const m = /^-\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(([^)]*)\)/.exec(line)
   return m !== null && m[1] === file
 }
 
@@ -424,37 +501,82 @@ export function oneLine(value) {
 /**
  * 决定一条记忆该写进哪个文件名。
  *
- * ## 三种情形
+ * ## 一条铁律：**只有「同一条记忆」才允许覆盖**
  *
- * 1. **显式传了 `file`** → 那是有意覆盖（"传同一个 file 覆盖更新"），照用。
- * 2. **派生出的文件名还不存在** → 用它。
- * 3. **派生出的文件名已存在** → 再看 frontmatter 里的 `name`：
- *    - `name` 相同 = 同一条记忆被重复保存 → **就地更新**（这是既有契约：
- *      "同一文件重复保存 = 就地更新，索引条目不会重复"）；
- *    - `name` 不同 = **slug 撞车**，两条不同主题的记忆挤到了同一个文件名上。
+ * 覆盖的判据不是"文件名对上了"，而是"文件名对上了**且** frontmatter 里的
+ * `name` 也是同一个"。两条不同主题的记忆**绝不允许**共用一份正文 —— 后写的
+ * 会把先写的整条抹掉，而文件名、索引行数、错误日志全都看不出这事发生过。
  *
- * 第 3 种的后半是实测确认的真事故：`slugify()` 会把所有非
- * `[a-z0-9\u4e00-\u9fa5]` 字符替换成 `_`，于是「重试机制」与「重试机制！」派生出
- * **同一个** `feedback_重试机制.md`，后写的把先写的**整条覆盖掉**，索引里也只留后一条 ——
- * 前一条无声消失。长标题更危险：`slugify` 截断到 40 字符，前 40 字相同的标题必然撞车。
+ * ## 显式传 `file` 不再无条件照用（2026-10-18 修）
  *
- * 所以这里加了序号后缀另起一个文件。**宁可多一条可见的重复，也不要少一条不可见的记忆** ——
- * 重复可以在索引里被人一眼看见并手工合并，丢失看不见。
+ * 早先这里是 `if (requested !== undefined) return requested` —— 显式路径
+ * **完全绕过**了下面对撞车的防护。当时的理由是"传同一个 file 就是有意覆盖"，
+ * 但那只在**调用方知道自己在覆盖什么**时成立。
+ *
+ * 后台总结并不具备这个前提：它只拿到「文件名 + 描述」清单（见
+ * `formatMemoryManifest()`），**看不到正文**，而清单是把 global 与 project
+ * 两个作用域合并渲染的。于是模型凭"名字听着像"就把清单里某一条的文件名填进
+ * `file`，一条完全无关的新记忆就被写进了别人的文件里。
+ *
+ * 已确认的真实事故：
+ *
+ * 1. **2026-10-15（最典型）** 主对话里先存了"本机 GitHub git 加速走 gh-proxy 镜像"，
+ *    同一会话后面写"gen-4/gen-5 仓库错位"时把前者的文件名填进了 `file`，
+ *    于是镜像那条被整份换成逆向仓库的内容，**镜像知识彻底丢失**（只能重测重写）。
+ *    同一天的两个备份里都已是错内容，事后无法恢复 —— 这正是"静默丢数据"。
+ * 2. 2026-09-21 / 09-27：global 的 `project_社保国产化工作区与开发环境速查.md`
+ *    被两个 sbf 项目工作区各抄一次，共 9 例（另有 4 条 codegraph 记忆被抄进 global）。
+ *
+ * 注意第 1 例是**主对话里的 memory_md_save**，不是后台总结 —— 说明这条路径
+ * 依赖调用方的自觉，而模型只要"觉得文件名像"就会填，光靠提示词约束不住。
+ *
+ * 所以现在显式路径也要过同名检查：`file` 指向的现有文件若有**不同的 name**，
+ * 一律视为撞车，改走派生 + 序号后缀。
+ *
+ * ⚠️ 别把这条改回"显式就照用"。那样 `memory_md_save` 传同一个 file 覆盖更新
+ * 仍然是通的（name 本来就一致），但后台总结抄错名字的路径会重新打开。
+ *
+ * ## 派生命名为什么要另起序号
+ *
+ * `slugify()` 会把所有非 `[a-z0-9\u4e00-\u9fa5]` 字符替换成 `_`，于是
+ * 「重试机制」与「重试机制！」派生出**同一个** `feedback_重试机制.md`；
+ * 长标题更危险：`slugify` 截断到 40 字符，前 40 字相同的标题必然撞车。
+ *
+ * 所以撞车时加序号后缀另起一个文件。**宁可多一条可见的重复，也不要少一条
+ * 不可见的记忆** —— 重复可以在索引里被人一眼看见并手工合并，丢失看不见。
  *
  * @param requested - 调用方显式指定的文件名（已过 `normalizeMemoryFile`）；无则派生。
  * @returns 纯文件名（不含目录）。
  */
 export function resolveMemoryFile(dir, { requested, type, name }) {
-  if (requested !== undefined) return requested
+  // ⚠️ 必须和 `writeMemory()` 落盘时用的是**同一个**归一化值。
+  // 那边把 name 过 `oneLine()`（折叠空白）再写进 frontmatter，这里若拿原始
+  // `name` 去比，标题里多个换行/连续空格就会被判成"异名"，同一条记忆被
+  // 另存成 `-2` —— 一条看不见来源的重复。
+  //
+  // `stripNameResidue()` 同理：它剥掉标题里混进来的 `feedback_` 前缀与 `.md`/`_md`
+  // 残渣（见该函数的说明）。**两边必须用同一个值**，否则「存过一次带前缀的标题，
+  // 再按干净标题存」会被判成异名 → 另起 `-2`，正是要消灭的那种重复。
+  const wantName = stripNameResidue(name)
 
-  const slug = slugify(name)
+  // 显式传了 file：只有「文件不存在」（点名新建）或「同名」（覆盖更新）才照用。
+  if (requested !== undefined) {
+    const existing = readText(join(dir, MEMORY_DIR, requested))
+    if (existing === undefined) return requested
+    const { data } = parseMemoryFrontmatter(existing)
+    if (oneLine(data.name) === wantName) return requested
+    // 落到下面走派生命名 —— 不能覆盖别人。
+  }
+
+  const slug = slugify(wantName)
   const derived = `${type}_${slug}.md`
+  // 显式 file 撞了名时，派生名可能恰好就是那个被撞的文件；一并按"已存在"处理。
   const existing = readText(join(dir, MEMORY_DIR, derived))
   if (existing === undefined) return derived
 
   // 文件已存在。同名 → 更新；异名 → 撞车，另起一个。
   const { data } = parseMemoryFrontmatter(existing)
-  if (String(data.name ?? '') === String(name ?? '')) return derived
+  if (oneLine(data.name) === wantName) return derived
 
   for (let n = 2; n < 100; n++) {
     const candidate = `${type}_${slug}-${n}.md`
@@ -475,7 +597,12 @@ export function writeMemory(dir, { file, type, name, description, content }) {
   const created = readText(path) === undefined
   const body = String(content ?? '').trim()
   // ⚠️ 必须一行化：裸插值的换行会污染 frontmatter，进而能往索引里插任意行。
-  const safeName = oneLine(name)
+  //
+  // ⚠️ 还要过 `stripNameResidue()`，且**必须与 `resolveMemoryFile()` 用同一个值**：
+  // 派生文件名时剥掉了 `feedback_` / `.md` 残渣，落盘却把脏标题写进 frontmatter，
+  // 就会得到「文件名干净、标题脏」的条目 —— 下一次同名保存因标题对不上而被判成
+  // 异名，另起 `-2`。索引标题也来自这里，脏标题会一直显示给模型看。
+  const safeName = stripNameResidue(name)
   const safeDescription = oneLine(description)
   const frontmatter = ['---', `name: ${safeName}`, `description: ${safeDescription}`, `type: ${type}`, '---', '']
   writeAtomic(path, `${frontmatter.join('\n')}\n${body}\n`)
@@ -515,6 +642,154 @@ export function appendErrorLog(errorLogFile, message) {
   } catch {
     /* 错误日志失败不能再抛错 */
   }
+}
+
+/**
+ * 诊断转储的单个文件大小上限（字符）。
+ *
+ * 输出上限是 4000 token，正常最多也就一两万字符 —— 这个上限只是为了防
+ * **异常巨大的输出**（例如模型把整段转写复述了一遍）把磁盘写爆：真出现
+ * 那种情况，开头那部分已经足够判断"它到底输出了什么形状的东西"。
+ */
+export const DIAGNOSTIC_MAX_CHARS = 200_000
+
+/** 时间戳文件名片段：`20261012-163053`。 */
+export function fileStamp(now = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+}
+
+/**
+ * 把一个字符串渲染成**可读的分隔块**，用于诊断转储。
+ *
+ * 为什么要分隔块而不是直接拼：诊断文件里既有我们生成的元信息、也有模型
+ * 的原始输出，而原始输出**本身可能包含看起来像我们元信息的行**（比如模型
+ * 自己写了个 `## 上下文`）。没有明确边界时，人工排查会被自己的文件误导。
+ */
+function dumpSection(title, body) {
+  const text = String(body ?? '')
+  return `===== ${title} =====\n${text === '' ? '(空)' : text}\n`
+}
+
+/**
+ * 落盘一次后台总结失败的**完整现场**。
+ *
+ * ## 为什么需要它
+ *
+ * `error.log` 只能记一行（`appendErrorLog` 会把空白压成单行），因此它天然
+ * 答不了「模型到底输出了什么」—— 而"总结没写成"背后至少有**五种**互斥成因，
+ * 且**第一种最容易被忽略、实测却最常见**：
+ *
+ *   1. **调用本身失败**（`finish error` / `aborted`，输出为空）—— 压根没有 JSON；
+ *   2. 调用正常结束但输出为空（模型只出了推理）；
+ *   3. 撞上 `maxTokens` 被硬截断（JSON 缺尾）；
+ *   4. 模型输出了自然语言而非 JSON；
+ *   5. 有 JSON 但字符串里有裸换行等非法转义，配平成功而 `JSON.parse` 失败。
+ *
+ * 这五种修法完全不同（修链路 / 改提示词 / 调上限 / 改切片 / 加宽松解析），
+ * 只看 error.log 只能靠猜 —— 这正是 2026-10-12 那次排查卡住的地方：
+ * 93 行日志没有一行能回答"坏在哪里"。
+ *
+ * ⚠️ 分工：**判定**由 `summarize.mjs` 的 `classifyParseFailure()` 做（那里看得到
+ * finish 终态与原文长度），本函数只负责把现场**如实**写下来，不做任何推断。
+ * 早先 `error.log` 无条件写「JSON 不完整或格式错误」，等于在第 1、2 种情形下
+ * 凭空断言了一个不存在的"JSON 格式问题" —— 那句话直接把排查引向了死路。
+ *
+ * ## 写在哪
+ *
+ * `<memoryRoot>/diagnostics/`，与 `error.log` 同层（见 `resolvePaths()` 的
+ * 说明）。**不写进 `.journal/`** —— 那是给人读的叙事，塞原始输出会污染它。
+ *
+ * 失败时静默吞掉：诊断是排查的辅助，绝不能因为它失败而影响主流程。
+ *
+ * @returns 写入的文件名（供 error.log 引用）；失败时 undefined。
+ */
+export function writeDiagnosticDump(diagnosticsDir, { sessionId, summary, context, raw }) {
+  try {
+    if (typeof diagnosticsDir !== 'string' || !diagnosticsDir) return undefined
+    const body = String(raw ?? '')
+    const clipped = body.length > DIAGNOSTIC_MAX_CHARS
+      ? `${body.slice(0, DIAGNOSTIC_MAX_CHARS)}\n\n…（诊断转储截断：原文共 ${body.length} 字符）`
+      : body
+    // 会话 id 进文件名：一个目录里可能堆着多个会话的失败，不带来源就得逐个打开。
+    const short = typeof sessionId === 'string' && sessionId ? sessionId.slice(0, 8) : 'nosession'
+    const file = `${fileStamp()}-${short}-${summary}.txt`
+    const text = [
+      dumpSection('摘要', summary),
+      dumpSection('上下文', context),
+      // 原文放最后：人工打开文件先看到"是哪一次、什么上下文"，再往下看原文。
+      dumpSection('模型原始输出（逐字节）', clipped),
+    ].join('\n')
+    mkdirSync(diagnosticsDir, { recursive: true })
+    writeAtomic(join(diagnosticsDir, file), text)
+    return file
+  } catch {
+    /* 诊断转储失败不能再抛错 */
+    return undefined
+  }
+}
+
+/**
+ * 剥掉标题里被误当成内容一部分的「文件名残渣」。
+ *
+ * ## 为什么需要
+ *
+ * 派生文件名是 `${type}_${slugify(name)}.md`，而 `name` 的约定只是「简短标题」——
+ * 没有任何机制拦住模型把**文件名形态**的东西填进来。索引里的标题长这样：
+ * `- [feedback_断言必须回退验证会变红](memory/...)`，模型看到的就是带前缀的标题，
+ * 于是很自然地把 `feedback_xxx` 甚至 `xxx.md` 原样填回 `name`：
+ *
+ *   name = `feedback_断言必须回退验证会变红.md`
+ *   → `feedback_` + slugify(`feedback_断言必须回退验证会变红.md`)
+ *   → `feedback_feedback_断言必须回退验证会变红_md.md`   ← 双前缀 + `_md` 残渣
+ *
+ * 实测该形态已在库里积累 27 个双前缀、22 个 `_md` 结尾（共 527 条）。
+ * 文件名难看只是表象，真正的代价是**同一件事被拆成两条**：一旦有人按正确
+ * 形态再存一次，slug 不同 → 另起文件 → 两条内容相近的记忆并存，索引里
+ * 看不出哪条是旧的。
+ *
+ * ## 剥的规则
+ *
+ * - 开头的 `<type>_` 前缀：**四种类型前缀全剥**，不只剥与本次 `type` 相同的那一个。
+ *   理由是 `feedback_user_用户身份.md` 这种名字同样是脏的：模型把 `user_` 当成了
+ *   标题的一部分，而文件名已有的 `feedback_` 才是唯一的类型标签；保留它会让
+ *   同一个话题下 `user_xxx` 与 `feedback_user_xxx` 两种形态并存，检索时对不上。
+ *   代价是标题真以「user 」「project 」等词开头的会被误剥，但标题是给人读的、
+ *   剥完仍通顺，且模型本来就不该在标题里写类型标签。
+ * - 结尾的 `.md`：转义前先去掉；`_md` 只在**它来自 `.md` 时**才去 —— 但字符串
+ *   里已经看不出出处了，所以只在同时满足「剥掉前缀后仍以 `_md` 结尾」且
+ *   「去掉后标题非空」时才剥。`dsh_memory_md` 这种中间带 `_md` 的不受影响。
+ *
+ * 前缀剥离**循环到剥不动为止**（`feedback_feedback_xxx` → `xxx`）：库里已积累
+ * 双前缀条目，一次只剥一层的话，脏名再存一次仍是 `feedback_feedback_xxx`，
+ * 永远清不干净。循环终止条件是「剥完为空」或「开头不再是类型前缀」。
+ *
+ * @returns 净化后的标题；若净化后为空则原样返回（不能把标题弄没）。
+ */
+export function stripNameResidue(name) {
+  const raw = oneLine(name)
+  if (!raw) return raw
+  let title = raw
+  // 1) 去掉结尾的 `.md`（模型把文件名当标题填了）。
+  if (/\.md$/i.test(title)) title = title.replace(/\.md$/i, '').trim()
+  // 2) 循环剥掉开头任意一种类型前缀。`rest` 非空才接受，否则会剥成空串。
+  for (;;) {
+    const hit = MEMORY_TYPES.find((t) =>
+      title.toLowerCase().startsWith(`${t}_`.toLowerCase()),
+    )
+    if (hit === undefined) break
+    const rest = title.slice(hit.length + 1).trim()
+    if (!rest) break
+    title = rest
+  }
+  // 3) `_md` 残渣（来自上一步已去掉的 `.md`，或模型抄了 `xxx_md`）。
+  //    只在不伤及正文语义时剥：剥完仍非空。
+  if (/_md$/i.test(title)) {
+    const rest = title.replace(/_md$/i, '').trim()
+    if (rest) title = rest
+  }
+  return title || raw
 }
 
 /** 把标题转成安全的文件名片段。 */

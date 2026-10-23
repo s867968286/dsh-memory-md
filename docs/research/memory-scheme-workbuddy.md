@@ -371,4 +371,4 @@ Layer 3 的 `MEMORY.md` **实际不存在**。按提示词，它只在两种情�
 **与 CodeBuddy 的核心差异：**
 - WorkBuddy = **提示词约定派**（清单规则 + 自清理 + 模型自觉）
 - CodeBuddy = **工程检索派**（Grep + 语义召回 + typed frontmatter + glob 触发）
-- **本方案：以 CodeBuddy 为主干，吸收 WorkBuddy 的提示词规则**（见 `docs/plan.md`）
+- **本方案：以 CodeBuddy 为主干，吸收 WorkBuddy 的提示词规则**（见 `docs/design/plan.md`）

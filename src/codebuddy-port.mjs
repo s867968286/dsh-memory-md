@@ -50,21 +50,37 @@ export const MEMORY_TYPES = ['user', 'feedback', 'project', 'reference']
  * ------------------------------------------------------------------ */
 
 /**
- * `getCompressedWorkDir()` 的移植。
+ * `getCompressedWorkDir()` 的移植（**有一处有意偏离上游**，见下）。
  *
- * 规则：绝对路径的盘符与分隔符转 `-`，整体小写。
+ * 规则：盘符、路径分隔符转 `-`，连续 `-` 压成一个，去掉首尾 `-`，英文整体小写，
+ * **中文等非 ASCII 字符原样保留**（其余 ASCII 标点仍按上游折成 `-`）。
  *
  *   D:\workspaces\ai\dsh-memory-md  ->  d-workspaces-ai-dsh-memory-md
+ *   D:\坚果云工作日志               ->  d-坚果云工作日志
+ *
+ * ⚠️ **偏离上游**：原版是 `.replace(/[^A-Za-z0-9]+/g, '-')`，把非 ASCII 一律当分隔符，
+ * 于是任何含中文的路径都塌缩成盘符（`D:\测试中文路径` → `d`、`D:\坚果云工作日志` → `d`），
+ * 所有中文项目共用一个作用域目录、记忆跨项目串味。现在字符类放宽到
+ * `[^A-Za-z0-9\u0080-\uFFFF]`，只对 ASCII 部分保持上游行为 ——
+ * 因此 ASCII 路径的新旧输出**完全一致**，已有目录无需迁移。
  *
  * 原版跑在 `process.cwd()`；这里由调用方传入绝对路径。
  */
 export function getCompressedWorkDir(cwd) {
-  let normalized = String(cwd)
+  let s = String(cwd)
     .replace(/\\/g, '/')
     .replace(/^([A-Za-z]):/, '$1')
   // 去掉开头斜杠，让 POSIX 绝对路径也保持单前缀
-  normalized = normalized.replace(/^\/+/, '')
-  return normalized.replace(/[^A-Za-z0-9]+/g, '-').replace(/-+$/g, '').toLowerCase()
+  s = s.replace(/^\/+/, '')
+  return (
+    s
+      // ASCII 的非字母数字（`~`、`.`、`_`、多余的冒号……）仍按上游折成 `-`：
+      // 这是为了**一字不改地保住现有 ASCII 目录名**，别顺手"改进"成保留点号。
+      .replace(/[^A-Za-z0-9\u0080-\uFFFF]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase()
+  )
 }
 
 /**

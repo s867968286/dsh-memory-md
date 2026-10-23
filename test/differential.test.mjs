@@ -98,5 +98,24 @@ check('大小写混合', getCompressedWorkDir('C:\\WorkSpace\\MyApp'), 'c-worksp
 check('结尾分隔符', getCompressedWorkDir('D:\\a\\b\\'), 'd-a-b')
 check('正斜杠', getCompressedWorkDir('D:/workspaces/ai/x'), 'd-workspaces-ai-x')
 
+// ⚠️ 这几条是**故意与 bundle 不同**的行为（本插件有意的偏离，见
+// `getCompressedWorkDir()` 的注释）：原版 `[^A-Za-z0-9]+` 会把中文整段当分隔符
+// 抹掉，于是任何含中文的路径都塌缩成盘符 `d`，所有中文项目共用一个作用域目录。
+console.log('\ngetCompressedWorkDir：中文路径不得塌缩（与上游有意不同）')
+check('中文路径保留中文', getCompressedWorkDir('D:\\测试中文路径'), 'd-测试中文路径')
+check('中文路径保留中文', getCompressedWorkDir('D:\\坚果云工作日志'), 'd-坚果云工作日志')
+check('中英混排', getCompressedWorkDir('D:\\项目A\\SubDir'), 'd-项目a-subdir')
+check('中文路径不与盘符撞车', getCompressedWorkDir('D:\\测试中文路径') === 'd', false)
+check(
+  '不同中文路径必须产出不同 slug',
+  getCompressedWorkDir('D:\\项目甲') !== getCompressedWorkDir('D:\\项目乙'),
+  true,
+)
+// 修复不能顺带改掉 ASCII 路径的输出 —— 那会让所有已有作用域目录失联。
+// （`~`、`.` 之类的 ASCII 标点旧实现也是当分隔符的，新实现保持这一点，
+// 于是 `\.dsh` 仍被折成 `-dsh` 而不是保留点号。）
+check('ASCII 路径不受影响', getCompressedWorkDir('C:\\Users\\kosei\\.dsh'), 'c-users-kosei-dsh')
+check('ASCII 标点仍折叠', getCompressedWorkDir('D:\\a.b\\c_d'), 'd-a-b-c-d')
+
 console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`}`)
 process.exit(failures === 0 ? 0 : 1)
